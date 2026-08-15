@@ -1,0 +1,2474 @@
+{
+    "schema_version": 1,
+    "gpus": [{
+            "index": 0,
+            "name": "NVIDIA GeForce RTX 5050",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": true,
+                "av1": true
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": true,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 1,
+            "name": "NVIDIA GeForce RTX 5060",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": true,
+                "av1": true
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": true,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 2,
+            "name": "NVIDIA GeForce RTX 5060 Ti",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": true,
+                "av1": true
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": true,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 3,
+            "name": "NVIDIA GeForce RTX 5070",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": true,
+                "av1": true
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": true,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 4,
+            "name": "NVIDIA GeForce RTX 5070 Ti",
+            "encoder_engines": 2,
+            "encode": {
+                "hevc": true,
+                "av1": true
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": true,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 5,
+            "name": "NVIDIA GeForce RTX 5080",
+            "encoder_engines": 2,
+            "encode": {
+                "hevc": true,
+                "av1": true
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": true,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 6,
+            "name": "NVIDIA GeForce RTX 5090",
+            "encoder_engines": 3,
+            "encode": {
+                "hevc": true,
+                "av1": true
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": true,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 7,
+            "name": "NVIDIA GeForce RTX 4060",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": true,
+                "av1": true
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": true,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 8,
+            "name": "NVIDIA GeForce RTX 4060 Ti",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": true,
+                "av1": true
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": true,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 9,
+            "name": "NVIDIA GeForce RTX 4070",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": true,
+                "av1": true
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": true,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 10,
+            "name": "NVIDIA GeForce RTX 4070 SUPER",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": true,
+                "av1": true
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": true,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 11,
+            "name": "NVIDIA GeForce RTX 4070 Ti",
+            "encoder_engines": 2,
+            "encode": {
+                "hevc": true,
+                "av1": true
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": true,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 12,
+            "name": "NVIDIA GeForce RTX 4070 Ti SUPER",
+            "encoder_engines": 2,
+            "encode": {
+                "hevc": true,
+                "av1": true
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": true,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 13,
+            "name": "NVIDIA GeForce RTX 4080",
+            "encoder_engines": 2,
+            "encode": {
+                "hevc": true,
+                "av1": true
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": true,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 14,
+            "name": "NVIDIA GeForce RTX 4080 SUPER",
+            "encoder_engines": 2,
+            "encode": {
+                "hevc": true,
+                "av1": true
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": true,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 15,
+            "name": "NVIDIA GeForce RTX 4090",
+            "encoder_engines": 2,
+            "encode": {
+                "hevc": true,
+                "av1": true
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": true,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 16,
+            "name": "NVIDIA GeForce RTX 3050",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": true,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 17,
+            "name": "NVIDIA GeForce RTX 3060",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": true,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 18,
+            "name": "NVIDIA GeForce RTX 3060 Ti",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": true,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 19,
+            "name": "NVIDIA GeForce RTX 3070",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": true,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 20,
+            "name": "NVIDIA GeForce RTX 3070 Ti",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": true,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 21,
+            "name": "NVIDIA GeForce RTX 3080",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": true,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 22,
+            "name": "NVIDIA GeForce RTX 3080 Ti",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": true,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 23,
+            "name": "NVIDIA GeForce RTX 3090",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": true,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 24,
+            "name": "NVIDIA GeForce RTX 3090 Ti",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": true,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 25,
+            "name": "NVIDIA GeForce GTX 1630",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 26,
+            "name": "NVIDIA GeForce GTX 1650",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 27,
+            "name": "NVIDIA GeForce GTX 1650 SUPER",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 28,
+            "name": "NVIDIA GeForce GTX 1660",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 29,
+            "name": "NVIDIA GeForce GTX 1660 SUPER",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 30,
+            "name": "NVIDIA GeForce GTX 1660 Ti",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 31,
+            "name": "NVIDIA GeForce RTX 2060",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 32,
+            "name": "NVIDIA GeForce RTX 2060 SUPER",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 33,
+            "name": "NVIDIA GeForce RTX 2070",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 34,
+            "name": "NVIDIA GeForce RTX 2070 SUPER",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 35,
+            "name": "NVIDIA GeForce RTX 2080",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 36,
+            "name": "NVIDIA GeForce RTX 2080 SUPER",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 37,
+            "name": "NVIDIA GeForce RTX 2080 Ti",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 38,
+            "name": "NVIDIA TITAN RTX",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 39,
+            "name": "NVIDIA GeForce GT 1030",
+            "encoder_engines": 0,
+            "encode": {
+                "hevc": false,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": false,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 40,
+            "name": "NVIDIA GeForce GTX 1050",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": false,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 41,
+            "name": "NVIDIA GeForce GTX 1050 Ti",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": false,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 42,
+            "name": "NVIDIA GeForce GTX 1060",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": false,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 43,
+            "name": "NVIDIA GeForce GTX 1070",
+            "encoder_engines": 2,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 44,
+            "name": "NVIDIA GeForce GTX 1070 Ti",
+            "encoder_engines": 2,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 45,
+            "name": "NVIDIA GeForce GTX 1080",
+            "encoder_engines": 2,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 46,
+            "name": "NVIDIA GeForce GTX 1080 Ti",
+            "encoder_engines": 2,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": false,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 47,
+            "name": "NVIDIA TITAN Xp",
+            "encoder_engines": 2,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": false,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 48,
+            "name": "NVIDIA GeForce GTX 950",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": false,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 49,
+            "name": "NVIDIA GeForce GTX 960",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": false,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 50,
+            "name": "NVIDIA GeForce GTX 970",
+            "encoder_engines": 2,
+            "encode": {
+                "hevc": false,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": false,
+                "av1": false,
+                "vp8": true,
+                "vp9": false,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 51,
+            "name": "NVIDIA GeForce GTX 980",
+            "encoder_engines": 2,
+            "encode": {
+                "hevc": false,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": false,
+                "av1": false,
+                "vp8": true,
+                "vp9": false,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 52,
+            "name": "NVIDIA GeForce GTX 980 Ti",
+            "encoder_engines": 2,
+            "encode": {
+                "hevc": false,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": false,
+                "av1": false,
+                "vp8": true,
+                "vp9": false,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 53,
+            "name": "NVIDIA GeForce GTX TITAN X",
+            "encoder_engines": 2,
+            "encode": {
+                "hevc": false,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": false,
+                "av1": false,
+                "vp8": true,
+                "vp9": false,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 54,
+            "name": "NVIDIA RTX PRO 2000 Blackwell",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": true,
+                "av1": true
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": true,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 55,
+            "name": "NVIDIA RTX PRO 4000 Blackwell SFF Edition",
+            "encoder_engines": 2,
+            "encode": {
+                "hevc": true,
+                "av1": true
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": true,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 56,
+            "name": "NVIDIA RTX PRO 4000 Blackwell",
+            "encoder_engines": 2,
+            "encode": {
+                "hevc": true,
+                "av1": true
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": true,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 57,
+            "name": "NVIDIA RTX PRO 4500 Blackwell",
+            "encoder_engines": 2,
+            "encode": {
+                "hevc": true,
+                "av1": true
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": true,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 58,
+            "name": "NVIDIA RTX PRO 5000 Blackwell",
+            "encoder_engines": 3,
+            "encode": {
+                "hevc": true,
+                "av1": true
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": true,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 59,
+            "name": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+            "encoder_engines": 4,
+            "encode": {
+                "hevc": true,
+                "av1": true
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": true,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 60,
+            "name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+            "encoder_engines": 4,
+            "encode": {
+                "hevc": true,
+                "av1": true
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": true,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 61,
+            "name": "NVIDIA RTX 2000 Ada Generation",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": true,
+                "av1": true
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": true,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 62,
+            "name": "NVIDIA RTX 4000 SFF Ada Generation",
+            "encoder_engines": 2,
+            "encode": {
+                "hevc": true,
+                "av1": true
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": true,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 63,
+            "name": "NVIDIA RTX 4000 Ada Generation",
+            "encoder_engines": 2,
+            "encode": {
+                "hevc": true,
+                "av1": true
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": true,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 64,
+            "name": "NVIDIA RTX 4500 Ada Generation",
+            "encoder_engines": 2,
+            "encode": {
+                "hevc": true,
+                "av1": true
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": true,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 65,
+            "name": "NVIDIA RTX 5000 Ada Generation",
+            "encoder_engines": 2,
+            "encode": {
+                "hevc": true,
+                "av1": true
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": true,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 66,
+            "name": "NVIDIA RTX 6000 Ada Generation",
+            "encoder_engines": 3,
+            "encode": {
+                "hevc": true,
+                "av1": true
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": true,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 67,
+            "name": "NVIDIA RTX A400",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": true,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 68,
+            "name": "NVIDIA RTX A1000",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": true,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 69,
+            "name": "NVIDIA RTX A2000",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": true,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 70,
+            "name": "NVIDIA RTX A4000",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": true,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 71,
+            "name": "NVIDIA RTX A4500",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": true,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 72,
+            "name": "NVIDIA RTX A5000",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": true,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 73,
+            "name": "NVIDIA RTX A5500",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": true,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 74,
+            "name": "NVIDIA RTX A6000",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": true,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 75,
+            "name": "NVIDIA T400",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 76,
+            "name": "NVIDIA T600",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 77,
+            "name": "NVIDIA T1000",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 78,
+            "name": "NVIDIA Quadro RTX 3000",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 79,
+            "name": "NVIDIA Quadro RTX 4000",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 80,
+            "name": "NVIDIA Quadro RTX 5000",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 81,
+            "name": "NVIDIA Quadro RTX 6000",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 82,
+            "name": "NVIDIA Quadro RTX 8000",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 83,
+            "name": "NVIDIA Quadro P400",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": false,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 84,
+            "name": "NVIDIA Quadro P620",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": false,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 85,
+            "name": "NVIDIA Quadro P1000",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": false,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 86,
+            "name": "NVIDIA Quadro P2000",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": false,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 87,
+            "name": "NVIDIA Quadro P2200",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": false,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 88,
+            "name": "NVIDIA Quadro P4000",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 89,
+            "name": "NVIDIA Quadro P5000",
+            "encoder_engines": 2,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 90,
+            "name": "NVIDIA Quadro P6000",
+            "encoder_engines": 2,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": false,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 91,
+            "name": "NVIDIA Quadro GP100",
+            "encoder_engines": 3,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 92,
+            "name": "NVIDIA Quadro GV100",
+            "encoder_engines": 3,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 93,
+            "name": "NVIDIA RTX PRO 4500 Blackwell Server Edition",
+            "encoder_engines": 3,
+            "encode": {
+                "hevc": true,
+                "av1": true
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": true,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 94,
+            "name": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+            "encoder_engines": 4,
+            "encode": {
+                "hevc": true,
+                "av1": true
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": true,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 95,
+            "name": "NVIDIA B100",
+            "encoder_engines": 0,
+            "encode": {
+                "hevc": false,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": true,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 96,
+            "name": "NVIDIA B200",
+            "encoder_engines": 0,
+            "encode": {
+                "hevc": false,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": true,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 97,
+            "name": "NVIDIA HGX B200",
+            "encoder_engines": 0,
+            "encode": {
+                "hevc": false,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": true,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 98,
+            "name": "NVIDIA B300",
+            "encoder_engines": 0,
+            "encode": {
+                "hevc": false,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": true,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 99,
+            "name": "NVIDIA HGX B300",
+            "encoder_engines": 0,
+            "encode": {
+                "hevc": false,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": true,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 100,
+            "name": "NVIDIA GB200",
+            "encoder_engines": 0,
+            "encode": {
+                "hevc": false,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": true,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 101,
+            "name": "NVIDIA GB300",
+            "encoder_engines": 0,
+            "encode": {
+                "hevc": false,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": true,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 102,
+            "name": "NVIDIA H20",
+            "encoder_engines": 0,
+            "encode": {
+                "hevc": false,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 103,
+            "name": "NVIDIA H100",
+            "encoder_engines": 0,
+            "encode": {
+                "hevc": false,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 104,
+            "name": "NVIDIA H100 SXM",
+            "encoder_engines": 0,
+            "encode": {
+                "hevc": false,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 105,
+            "name": "NVIDIA H100 PCIe",
+            "encoder_engines": 0,
+            "encode": {
+                "hevc": false,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 106,
+            "name": "NVIDIA H100 NVL",
+            "encoder_engines": 0,
+            "encode": {
+                "hevc": false,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 107,
+            "name": "NVIDIA H200",
+            "encoder_engines": 0,
+            "encode": {
+                "hevc": false,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 108,
+            "name": "NVIDIA H200 SXM",
+            "encoder_engines": 0,
+            "encode": {
+                "hevc": false,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 109,
+            "name": "NVIDIA H200 NVL",
+            "encoder_engines": 0,
+            "encode": {
+                "hevc": false,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 110,
+            "name": "NVIDIA H800",
+            "encoder_engines": 0,
+            "encode": {
+                "hevc": false,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 111,
+            "name": "NVIDIA A100",
+            "encoder_engines": 0,
+            "encode": {
+                "hevc": false,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 112,
+            "name": "NVIDIA A100 SXM",
+            "encoder_engines": 0,
+            "encode": {
+                "hevc": false,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 113,
+            "name": "NVIDIA A100 PCIe",
+            "encoder_engines": 0,
+            "encode": {
+                "hevc": false,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 114,
+            "name": "NVIDIA A800",
+            "encoder_engines": 0,
+            "encode": {
+                "hevc": false,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 115,
+            "name": "NVIDIA A30",
+            "encoder_engines": 0,
+            "encode": {
+                "hevc": false,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 116,
+            "name": "NVIDIA A40",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": true,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 117,
+            "name": "NVIDIA A16",
+            "encoder_engines": 4,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": true,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 118,
+            "name": "NVIDIA A10",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": true,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 119,
+            "name": "NVIDIA A2",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": true,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 120,
+            "name": "NVIDIA L40",
+            "encoder_engines": 3,
+            "encode": {
+                "hevc": true,
+                "av1": true
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": true,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 121,
+            "name": "NVIDIA L40S",
+            "encoder_engines": 3,
+            "encode": {
+                "hevc": true,
+                "av1": true
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": true,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 122,
+            "name": "NVIDIA L4",
+            "encoder_engines": 2,
+            "encode": {
+                "hevc": true,
+                "av1": true
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": true,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 123,
+            "name": "NVIDIA Tesla T4",
+            "encoder_engines": 1,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 124,
+            "name": "NVIDIA Tesla V100",
+            "encoder_engines": 3,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 125,
+            "name": "NVIDIA Tesla V100 SXM2",
+            "encoder_engines": 3,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 126,
+            "name": "NVIDIA Tesla V100 PCIe",
+            "encoder_engines": 3,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 127,
+            "name": "NVIDIA Tesla P4",
+            "encoder_engines": 2,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 128,
+            "name": "NVIDIA Tesla P40",
+            "encoder_engines": 2,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": false,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        },
+        {
+            "index": 129,
+            "name": "NVIDIA Tesla P100",
+            "encoder_engines": 3,
+            "encode": {
+                "hevc": true,
+                "av1": false
+            },
+            "decode": {
+                "h264": true,
+                "hevc": true,
+                "av1": false,
+                "vp8": true,
+                "vp9": true,
+                "mpeg1": true,
+                "mpeg2": true,
+                "vc1": true
+            }
+        }
+    ]
+}
