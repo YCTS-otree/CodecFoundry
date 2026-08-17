@@ -48,6 +48,22 @@ def make_settings(codec: str = "hevc") -> cf.EncodeSettings:
     )
 
 
+def _close_window(window) -> None:
+    """Close a test window deterministically (filter removed, object deleted)."""
+    app = cf.QApplication.instance()
+    if app is not None:
+        try:
+            app.removeEventFilter(window)
+        except RuntimeError:
+            pass
+    window.app_logger.close()
+    window.close_finalized = True
+    window.close()
+    window.deleteLater()
+    if app is not None:
+        app.processEvents()
+
+
 def make_item(output_name: str, codec: str = "hevc", preferred_slot: int = 0) -> cf.PendingTaskItem:
     return cf.PendingTaskItem(
         task=make_task(output_name, codec),
@@ -554,9 +570,7 @@ class GuiReorderTests(unittest.TestCase):
         try:
             window._handle_card_reorder("C", "A")
         finally:
-            window.app_logger.close()
-            window.close_finalized = True
-            window.close()
+            _close_window(window)
         self.assertEqual(window.waiting_order, ["C", "A", "B"])
         fake_scheduler.reorder_waiting.assert_called_once_with(["C", "A", "B"])
 
@@ -568,9 +582,7 @@ class GuiReorderTests(unittest.TestCase):
         try:
             window._handle_card_reorder("MISSING", "A")
         finally:
-            window.app_logger.close()
-            window.close_finalized = True
-            window.close()
+            _close_window(window)
         self.assertEqual(window.waiting_order, ["A", "B"])
         fake_scheduler.reorder_waiting.assert_not_called()
 
@@ -602,9 +614,7 @@ class GuiReorderTests(unittest.TestCase):
             window._update_task_card(waiting_key, "running", 0)
             self.assertFalse(window.begin_card_drag(waiting_key))
         finally:
-            window.app_logger.close()
-            window.close_finalized = True
-            window.close()
+            _close_window(window)
 
     def test_drag_moved_live_reorders_waiting_order(self):
         window = cf.CodecFoundryWindow()
@@ -637,9 +647,7 @@ class GuiReorderTests(unittest.TestCase):
             window.on_card_drag_finished(keys[0])
             self.assertEqual(window.waiting_order, [keys[1], keys[0], keys[2]])
         finally:
-            window.app_logger.close()
-            window.close_finalized = True
-            window.close()
+            _close_window(window)
 
     def test_ffmpeg_setup_window_shows_manual_buttons_on_failure(self):
         window = cf.FfmpegSetupWindow()
@@ -741,9 +749,7 @@ class FramelessResizeTests(unittest.TestCase):
             self.assertIsNone(window._resize_edge_at(cf.QPoint(width // 2, height - 6)))
             self.assertIsNone(window._resize_edge_at(cf.QPoint(width // 2, height // 2)))
         finally:
-            window.app_logger.close()
-            window.close_finalized = True
-            window.close()
+            _close_window(window)
 
     def test_press_on_edge_starts_resize_and_resizes_on_move(self):
         window = cf.CodecFoundryWindow()
@@ -763,9 +769,7 @@ class FramelessResizeTests(unittest.TestCase):
             self.assertTrue(window.eventFilter(window, release))
             self.assertIsNone(window._resize_edge)
         finally:
-            window.app_logger.close()
-            window.close_finalized = True
-            window.close()
+            _close_window(window)
 
     def test_press_inside_window_never_resizes(self):
         window = cf.CodecFoundryWindow()
@@ -779,9 +783,7 @@ class FramelessResizeTests(unittest.TestCase):
             self.assertFalse(window.eventFilter(window, press))
             self.assertIsNone(window._resize_edge)
         finally:
-            window.app_logger.close()
-            window.close_finalized = True
-            window.close()
+            _close_window(window)
 
     def test_minimum_size_is_respected_while_resizing(self):
         window = cf.CodecFoundryWindow()
@@ -800,9 +802,7 @@ class FramelessResizeTests(unittest.TestCase):
             release = self._mouse_event(cf.QEvent.Type.MouseButtonRelease, left_edge)
             window.eventFilter(window, release)
         finally:
-            window.app_logger.close()
-            window.close_finalized = True
-            window.close()
+            _close_window(window)
 
     def test_press_over_foreign_popup_does_not_start_resize(self):
         window = cf.CodecFoundryWindow()
@@ -812,16 +812,15 @@ class FramelessResizeTests(unittest.TestCase):
             self.app.processEvents()
             rect = window.geometry()
             right_edge = window.mapToGlobal(cf.QPoint(rect.width() - 2, rect.height() // 2))
-            foreign = mock.Mock()
-            foreign.window.return_value = foreign  # a dialog, not our window
+            foreign = cf.QWidget()  # a real top-level (dialog-like) widget
+            self.assertIs(foreign.window(), foreign)
             press = self._mouse_event(cf.QEvent.Type.MouseButtonPress, right_edge)
             with mock.patch.object(cf.QApplication, "widgetAt", return_value=foreign):
                 self.assertFalse(window.eventFilter(window, press))
             self.assertIsNone(window._resize_edge)
+            foreign.deleteLater()
         finally:
-            window.app_logger.close()
-            window.close_finalized = True
-            window.close()
+            _close_window(window)
 
     def test_press_over_scrollbar_like_child_still_resizes(self):
         # Even when a scrollbar sits under the right border, the press must
@@ -842,9 +841,30 @@ class FramelessResizeTests(unittest.TestCase):
             release = self._mouse_event(cf.QEvent.Type.MouseButtonRelease, right_edge)
             window.eventFilter(window, release)
         finally:
-            window.app_logger.close()
-            window.close_finalized = True
-            window.close()
+            _close_window(window)
+
+    def test_splitter_handle_stays_draggable(self):
+        window = cf.CodecFoundryWindow()
+        try:
+            window.resize(1500, 900)
+            window.show()
+            self.app.processEvents()
+            # The sidebar width is bounded but never locked: min != max.
+            self.assertEqual(window.task_sidebar.minimumWidth(), 360)
+            self.assertEqual(window.task_sidebar.maximumWidth(), 760)
+            handle = window.main_splitter.handle(1)
+            self.assertIsNotNone(handle)
+            # A manual "drag" width is preserved by the responsive layout pass:
+            # the splitter scales the requested sizes to the available width,
+            # but must NOT reset the sidebar back to its initial default.
+            window.main_splitter.setSizes([900, 500])
+            window._apply_responsive_layout()
+            dragged_sizes = list(window.main_splitter.sizes())
+            window._apply_responsive_layout()
+            self.assertEqual(list(window.main_splitter.sizes()), dragged_sizes)
+            self.assertGreater(dragged_sizes[1], 360)
+        finally:
+            _close_window(window)
 
 
 if __name__ == "__main__":

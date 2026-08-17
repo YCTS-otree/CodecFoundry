@@ -5508,6 +5508,7 @@ class CodecFoundryWindow(QMainWindow):
         self._resize_edge: str | None = None
         self._resize_start_geometry: QRect | None = None
         self._resize_start_global: QPoint | None = None
+        self._sidebar_sizes_initialized = False
         app_instance = QApplication.instance()
         if app_instance is not None:
             app_instance.installEventFilter(self)
@@ -5894,8 +5895,8 @@ class CodecFoundryWindow(QMainWindow):
 
     def _build_task_sidebar(self) -> None:
         sidebar = QWidget()
-        sidebar.setMinimumWidth(300)
-        sidebar.setMaximumWidth(600)
+        sidebar.setMinimumWidth(360)
+        sidebar.setMaximumWidth(760)
         layout = QVBoxLayout(sidebar)
         layout.setContentsMargins(10, 8, 20, 12)
         title = QLabel("编码队列")
@@ -6108,9 +6109,19 @@ class CodecFoundryWindow(QMainWindow):
             return
         show_sidebar = self.width() >= 1380 and self.height() >= 760
         self.task_sidebar.setVisible(show_sidebar)
-        sidebar_width = self._task_sidebar_width()
-        self.task_sidebar.setMinimumWidth(sidebar_width)
-        self.task_sidebar.setMaximumWidth(sidebar_width)
+        # The splitter handle stays draggable: the sidebar width is bounded but
+        # never locked (min != max), and the initial proportion is set only once.
+        self.task_sidebar.setMinimumWidth(360)
+        self.task_sidebar.setMaximumWidth(760)
+        if not self._sidebar_sizes_initialized and show_sidebar:
+            self._sidebar_sizes_initialized = True
+            available = max(1, self.main_splitter.width())
+            sidebar_width = self._task_sidebar_width()
+            left_width = max(760, available - sidebar_width)
+            self.main_splitter.setSizes([left_width, sidebar_width])
+        handle = self.main_splitter.handle(1)
+        if handle is not None and handle.cursor().shape() != Qt.CursorShape.SizeHorCursor:
+            handle.setCursor(Qt.CursorShape.SizeHorCursor)
         left_margin = 36 if self.width() >= 980 else 22
         self.content_layout.setContentsMargins(left_margin, 8, 30, 12)
         self.bottom_layout.setContentsMargins(left_margin, 7, 30, 10)
