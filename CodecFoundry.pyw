@@ -13,6 +13,8 @@ import argparse
 import csv
 import ctypes
 from ctypes import wintypes
+import hashlib
+import io
 import json
 import logging
 from logging.handlers import RotatingFileHandler
@@ -32,7 +34,10 @@ from collections import deque
 from datetime import datetime
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Callable, Iterable, Sequence
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+from zipfile import BadZipFile, ZipFile
 
 
 def windows_creation_flags(*, new_process_group: bool = False) -> int:
@@ -104,8 +109,9 @@ def detach_windows_console_for_gui() -> None:
 # may still point at python.exe on a user's machine; handing off early prevents its
 # temporary console from lingering for the lifetime of the GUI application.
 if __name__ == "__main__" and not ({"--cli", "--version"} & set(sys.argv)):
-    if relaunch_gui_with_pythonw():
-        raise SystemExit(0)
+    if not os.environ.get("CODECFOUNDRY_NO_RELAUNCH"):
+        if relaunch_gui_with_pythonw():
+            raise SystemExit(0)
     detach_windows_console_for_gui()
 
 
@@ -214,6 +220,7 @@ class EncoderSlot:
     tasks: list[VideoTask] = field(default_factory=list)
     cpu_ids: tuple[int, ...] = ()
     slot_id: int = -1
+    codec: str | None = None
 
 
 @dataclass(frozen=True)
@@ -353,7 +360,7 @@ def say(message: str) -> None:
     with PRINT_LOCK:
         if OUTPUT_CALLBACK is not None:
             OUTPUT_CALLBACK(message)
-        else:
+        elif sys.stdout is not None:
             print(message, flush=True)
 
 
@@ -1292,7 +1299,7 @@ def create_slots(gpus: Sequence[GpuCapability], codec: str) -> list[EncoderSlot]
         )
         raise TranscodeError(f"所选 {codec.upper()} 硬件编码不受任何可用 GPU 支持。配置情况：{details}")
     return [
-        EncoderSlot(gpu=gpu, engine=engine)
+        EncoderSlot(gpu=gpu, engine=engine, codec=codec)
         for gpu in eligible
         for engine in range(gpu.encoder_engines)
     ]
@@ -1680,7 +1687,7 @@ def task_input_size(task: VideoTask) -> int:
 def write_compression_report(
     tasks: Sequence[VideoTask],
     results: Sequence[tuple[VideoTask, bool, str]],
-    settings: EncodeSettings,
+    settings: EncodeSettings | None,
     explicit_output_dir: Path | None,
     started_at: datetime,
     finished_at: datetime,
@@ -1688,15 +1695,21 @@ def write_compression_report(
     result_by_task = {task: (success, detail) for task, success, detail in results}
     successful_input = 0
     successful_output = 0
+    if settings is not None:
+        parameter_lines = [
+            f"输出编码：{settings.codec.upper()}",
+            f"CQ：{settings.cq:g}",
+            f"最大码率：{format_bitrate(settings.maxrate) if settings.maxrate else '无限制'}",
+        ]
+    else:
+        parameter_lines = ["输出参数：多种（本报告覆盖合并队列的多个请求）"]
     lines = [
         "NVENC 视频压制报告",
         "=" * 72,
         f"开始时间：{started_at:%Y-%m-%d %H:%M:%S}",
         f"结束时间：{finished_at:%Y-%m-%d %H:%M:%S}",
         f"总耗时：{finished_at - started_at}",
-        f"输出编码：{settings.codec.upper()}",
-        f"CQ：{settings.cq:g}",
-        f"最大码率：{format_bitrate(settings.maxrate) if settings.maxrate else '无限制'}",
+        *parameter_lines,
         "",
         "逐文件尺寸变化",
         "-" * 72,
@@ -1892,6 +1905,294 @@ def preserve_source_when_output_is_larger(
     return True, detail
 
 
+@dataclass(frozen=True)
+class QueueView:
+    """Snapshot of queue totals reported with a single task's lifecycle events."""
+
+    task_index: int
+    queue_total: int
+    queue_equivalent_frames: float
+    completed_equivalent_frames: float
+
+
+def encode_task(
+    slot: EncoderSlot,
+    task: VideoTask,
+    settings: EncodeSettings,
+    view: QueueView,
+    ffmpeg: str,
+    affinity_enabled: bool,
+    software_fallback: bool,
+    controller: ProcessController,
+    ffprobe: str = "ffprobe",
+    validation_gpus: Sequence[GpuCapability] = (),
+    finish_hook: Callable[[str | None], tuple[float, float]] | None = None,
+) -> tuple[VideoTask, bool, str]:
+    """Encode exactly one queued task and emit its full lifecycle events.
+
+    ``view`` carries the queue totals valid at task start.  ``finish_hook``, when
+    provided, is invoked with ``"success"``/``"failed"`` (accounting required) or
+    ``None`` (no accounting) right before the final ``task_done`` event and must
+    return the updated ``(completed_equivalent_frames, queue_equivalent_frames)``
+    pair used in that event.  This is how the live scheduler keeps global queue
+    totals accurate while the CLI wrapper keeps the original static accounting.
+    """
+    task_index = view.task_index
+    queue_total = view.queue_total
+    queue_equivalent_frames = view.queue_equivalent_frames
+    completed_equivalent_frames = view.completed_equivalent_frames
+    equivalent_frames = task_equivalent_frames(task, settings)
+
+    def updated_totals(account: str | None) -> tuple[float, float]:
+        if finish_hook is not None:
+            return finish_hook(account)
+        if account is None:
+            return completed_equivalent_frames, queue_equivalent_frames
+        return completed_equivalent_frames + equivalent_frames, queue_equivalent_frames
+
+    task_key = str(task.output)
+    if controller.cancelled or controller.task_cancelled(task_key):
+        detail = "批处理已取消" if controller.cancelled else "任务已取消 / 停止"
+        emit_event(
+            "task_done",
+            slot_id=slot.slot_id,
+            task_index=task_index,
+            status="cancelled",
+            source=str(task.source),
+            output=str(task.output),
+        )
+        return task, False, detail
+    hardware_decode = slot.gpu.can_decode(task.info.codec)
+    label = f"GPU{slot.gpu.index}/E{slot.slot_id} {task.label}"
+    try:
+        source_timestamps = capture_file_timestamps(task.source)
+    except OSError as exc:
+        source_timestamps = None
+        warn(f"{label}：无法读取源文件时间戳：{exc}")
+    if not hardware_decode:
+        warn(
+            f"{label}：GPU 不支持 {task.info.codec.upper()} 硬件解码；"
+            "将使用 CPU 解码，但输出仍由 NVENC 编码"
+        )
+    say(
+        f"[开始] {label} -> {task.output.name} | "
+        f"{'GPU' if hardware_decode else 'CPU'} 解码 | CPU {','.join(map(str, slot.cpu_ids))}"
+    )
+    total_frames = task_total_frames(task, settings)
+    width, height, target_fps = task_output_geometry(task, settings)
+    emit_event(
+        "task_start",
+        slot_id=slot.slot_id,
+        gpu_index=slot.gpu.index,
+        engine=slot.engine,
+        task_index=task_index,
+        queue_total=queue_total,
+        queue_equivalent_frames=queue_equivalent_frames,
+        completed_equivalent_frames=completed_equivalent_frames,
+        source=str(task.source),
+        output=str(task.output),
+        filename=task.label,
+        total_frames=total_frames,
+        equivalent_frames=equivalent_frames,
+        width=width,
+        height=height,
+        target_fps=target_fps,
+        duration=task.info.duration,
+    )
+
+    def progress_handler(metrics: dict[str, object]) -> None:
+        frame = int(metrics.get("frame") or 0)
+        out_time = metrics.get("out_time")
+        processed_frames = frame
+        if processed_frames <= 0 and out_time and target_fps:
+            processed_frames = round(float(out_time) * target_fps)
+        progress = min(1.0, processed_frames / total_frames) if total_frames else 0.0
+        measured_fps = float(metrics.get("fps") or 0)
+        speed = float(metrics.get("speed") or 0)
+        if measured_fps <= 0 and speed > 0 and target_fps:
+            measured_fps = speed * target_fps
+        eta_seconds = None
+        if total_frames and measured_fps > 0:
+            eta_seconds = max(0.0, total_frames - processed_frames) / measured_fps
+        equivalent_fps = measured_fps * (width * height / REFERENCE_PIXELS)
+        emit_event(
+            "task_progress",
+            slot_id=slot.slot_id,
+            task_index=task_index,
+            progress=progress,
+            frame=processed_frames,
+            total_frames=total_frames,
+            encoding_fps=measured_fps,
+            speed=speed,
+            eta_seconds=eta_seconds,
+            equivalent_fps=equivalent_fps,
+            equivalent_frames=equivalent_frames,
+            completed_equivalent_frames=completed_equivalent_frames,
+            queue_equivalent_frames=queue_equivalent_frames,
+            finished=bool(metrics.get("finished")),
+        )
+
+    command = build_ffmpeg_command(task, slot.gpu, settings, ffmpeg, hardware_decode)
+    code, stderr_text = run_ffmpeg(
+        command,
+        label,
+        slot.cpu_ids,
+        affinity_enabled,
+        controller,
+        progress_handler,
+        task_key,
+    )
+    if (
+        code != 0
+        and hardware_decode
+        and software_fallback
+        and not controller.cancelled
+        and not controller.task_cancelled(task_key)
+    ):
+        warn(f"{label}：硬件解码路径失败，自动改用 CPU 解码重试")
+        try:
+            task.output.unlink(missing_ok=True)
+        except OSError:
+            pass
+        retry = build_ffmpeg_command(
+            task, slot.gpu, settings, ffmpeg, hardware_decode=False, force_overwrite=True
+        )
+        code, stderr_text = run_ffmpeg(
+            retry,
+            label,
+            slot.cpu_ids,
+            affinity_enabled,
+            controller,
+            progress_handler,
+            task_key,
+        )
+    if controller.cancelled or controller.task_cancelled(task_key):
+        remove_partial_output(task)
+        detail = "批处理已取消" if controller.cancelled else "任务已取消 / 停止"
+        say(f"[取消] {label}：{detail}")
+        completed_now, queue_now = updated_totals(None)
+        emit_event(
+            "task_done",
+            slot_id=slot.slot_id,
+            task_index=task_index,
+            status="cancelled",
+            source=str(task.source),
+            output=str(task.output),
+            completed_equivalent_frames=completed_now,
+            queue_equivalent_frames=queue_now,
+        )
+        return task, False, detail
+    if code == 0:
+        kept_source, result_detail = preserve_source_when_output_is_larger(
+            task, settings
+        )
+        emit_event(
+            "task_verification_start",
+            slot_id=slot.slot_id,
+            task_index=task_index,
+            source=str(task.source),
+            output=str(task.output),
+            filename=task.label,
+        )
+        say(f"[校验] {label}：正在使用 GPU / NVDEC 完整解码最终视频流")
+        valid_output, validation_detail = validate_existing_output(
+            task.output,
+            task.info,
+            ffprobe,
+            ffmpeg,
+            settings.codec,
+            settings.resolution,
+            settings.fps_value,
+            controller,
+            None if task.is_clip else task.source,
+            validation_gpus or (slot.gpu,),
+            task_key,
+        )
+        if controller.cancelled or controller.task_cancelled(task_key):
+            remove_partial_output(task)
+            say(f"[取消] {label}：输出校验已取消")
+            detail = "批处理已取消" if controller.cancelled else "任务已取消 / 停止"
+            completed_now, queue_now = updated_totals(None)
+            emit_event(
+                "task_done",
+                slot_id=slot.slot_id,
+                task_index=task_index,
+                status="cancelled",
+                source=str(task.source),
+                output=str(task.output),
+                completed_equivalent_frames=completed_now,
+                queue_equivalent_frames=queue_now,
+            )
+            return task, False, detail
+        if not valid_output:
+            remove_partial_output(task)
+            detail = f"编码完成，但最终输出未通过 GPU 校验：{validation_detail}"
+            say(f"[失败] {label}\n{detail}")
+            completed_now, queue_now = updated_totals("failed")
+            emit_event(
+                "task_done",
+                slot_id=slot.slot_id,
+                task_index=task_index,
+                status="failed",
+                source=str(task.source),
+                output=str(task.output),
+                error=detail,
+                completed_equivalent_frames=completed_now,
+                queue_equivalent_frames=queue_now,
+            )
+            return task, False, detail
+        result_detail = (
+            f"{result_detail}；{validation_detail}"
+            if result_detail
+            else validation_detail
+        )
+        if source_timestamps is not None:
+            try:
+                apply_file_timestamps(task.output, source_timestamps)
+            except OSError as exc:
+                warn(f"{label}：无法保留源文件的创建/修改时间：{exc}")
+                timestamp_detail = f"无法保留源文件时间戳：{exc}"
+                result_detail = (
+                    f"{result_detail}；{timestamp_detail}"
+                    if result_detail else timestamp_detail
+                )
+        if kept_source:
+            say(f"[保留原文件] {label}：{result_detail} -> {task.output}")
+        else:
+            say(f"[完成] {label} -> {task.output}")
+        completed_now, queue_now = updated_totals("success")
+        emit_event(
+            "task_done",
+            slot_id=slot.slot_id,
+            task_index=task_index,
+            status="success",
+            source=str(task.source),
+            output=str(task.output),
+            input_size=task.source.stat().st_size if task.source.exists() else None,
+            output_size=task.output.stat().st_size if task.output.exists() else None,
+            kept_source=kept_source,
+            detail=result_detail,
+            completed_equivalent_frames=completed_now,
+            queue_equivalent_frames=queue_now,
+        )
+        return task, True, result_detail
+    detail = error_tail(stderr_text) or f"FFmpeg 退出码 {code}"
+    say(f"[失败] {label}\n{detail}")
+    completed_now, queue_now = updated_totals("failed")
+    emit_event(
+        "task_done",
+        slot_id=slot.slot_id,
+        task_index=task_index,
+        status="failed",
+        source=str(task.source),
+        output=str(task.output),
+        error=detail,
+        completed_equivalent_frames=completed_now,
+        queue_equivalent_frames=queue_now,
+    )
+    return task, False, detail
+
+
 def run_slot(
     slot: EncoderSlot,
     settings: EncodeSettings,
@@ -1902,251 +2203,32 @@ def run_slot(
     ffprobe: str = "ffprobe",
     validation_gpus: Sequence[GpuCapability] = (),
 ) -> list[tuple[VideoTask, bool, str]]:
+    """Run one CLI encoder slot's static task list from first to last."""
     results: list[tuple[VideoTask, bool, str]] = []
     queue_equivalent_frames = sum(task_equivalent_frames(task, settings) for task in slot.tasks)
     completed_equivalent_frames = 0.0
     for task_index, task in enumerate(slot.tasks):
-        task_key = str(task.output)
-        if controller.cancelled or controller.task_cancelled(task_key):
-            detail = "批处理已取消" if controller.cancelled else "任务已取消 / 停止"
-            results.append((task, False, detail))
-            emit_event(
-                "task_done",
-                slot_id=slot.slot_id,
-                task_index=task_index,
-                status="cancelled",
-                source=str(task.source),
-                output=str(task.output),
-            )
-            continue
-        hardware_decode = slot.gpu.can_decode(task.info.codec)
-        label = f"GPU{slot.gpu.index}/E{slot.slot_id} {task.label}"
-        try:
-            source_timestamps = capture_file_timestamps(task.source)
-        except OSError as exc:
-            source_timestamps = None
-            warn(f"{label}：无法读取源文件时间戳：{exc}")
-        if not hardware_decode:
-            warn(
-                f"{label}：GPU 不支持 {task.info.codec.upper()} 硬件解码；"
-                "将使用 CPU 解码，但输出仍由 NVENC 编码"
-            )
-        say(
-            f"[开始] {label} -> {task.output.name} | "
-            f"{'GPU' if hardware_decode else 'CPU'} 解码 | CPU {','.join(map(str, slot.cpu_ids))}"
-        )
-        total_frames = task_total_frames(task, settings)
-        width, height, target_fps = task_output_geometry(task, settings)
-        equivalent_frames = task_equivalent_frames(task, settings)
-        emit_event(
-            "task_start",
-            slot_id=slot.slot_id,
-            gpu_index=slot.gpu.index,
-            engine=slot.engine,
+        view = QueueView(
             task_index=task_index,
             queue_total=len(slot.tasks),
             queue_equivalent_frames=queue_equivalent_frames,
             completed_equivalent_frames=completed_equivalent_frames,
-            source=str(task.source),
-            output=str(task.output),
-            filename=task.label,
-            total_frames=total_frames,
-            equivalent_frames=equivalent_frames,
-            width=width,
-            height=height,
-            target_fps=target_fps,
-            duration=task.info.duration,
         )
-
-        def progress_handler(metrics: dict[str, object]) -> None:
-            frame = int(metrics.get("frame") or 0)
-            out_time = metrics.get("out_time")
-            processed_frames = frame
-            if processed_frames <= 0 and out_time and target_fps:
-                processed_frames = round(float(out_time) * target_fps)
-            progress = min(1.0, processed_frames / total_frames) if total_frames else 0.0
-            measured_fps = float(metrics.get("fps") or 0)
-            speed = float(metrics.get("speed") or 0)
-            if measured_fps <= 0 and speed > 0 and target_fps:
-                measured_fps = speed * target_fps
-            eta_seconds = None
-            if total_frames and measured_fps > 0:
-                eta_seconds = max(0.0, total_frames - processed_frames) / measured_fps
-            equivalent_fps = measured_fps * (width * height / REFERENCE_PIXELS)
-            emit_event(
-                "task_progress",
-                slot_id=slot.slot_id,
-                task_index=task_index,
-                progress=progress,
-                frame=processed_frames,
-                total_frames=total_frames,
-                encoding_fps=measured_fps,
-                speed=speed,
-                eta_seconds=eta_seconds,
-                equivalent_fps=equivalent_fps,
-                equivalent_frames=equivalent_frames,
-                completed_equivalent_frames=completed_equivalent_frames,
-                queue_equivalent_frames=queue_equivalent_frames,
-                finished=bool(metrics.get("finished")),
-            )
-
-        command = build_ffmpeg_command(task, slot.gpu, settings, ffmpeg, hardware_decode)
-        code, stderr_text = run_ffmpeg(
-            command,
-            label,
-            slot.cpu_ids,
+        result = encode_task(
+            slot,
+            task,
+            settings,
+            view,
+            ffmpeg,
             affinity_enabled,
+            software_fallback,
             controller,
-            progress_handler,
-            task_key,
+            ffprobe,
+            validation_gpus,
         )
-        if (
-            code != 0
-            and hardware_decode
-            and software_fallback
-            and not controller.cancelled
-            and not controller.task_cancelled(task_key)
-        ):
-            warn(f"{label}：硬件解码路径失败，自动改用 CPU 解码重试")
-            try:
-                task.output.unlink(missing_ok=True)
-            except OSError:
-                pass
-            retry = build_ffmpeg_command(
-                task, slot.gpu, settings, ffmpeg, hardware_decode=False, force_overwrite=True
-            )
-            code, stderr_text = run_ffmpeg(
-                retry,
-                label,
-                slot.cpu_ids,
-                affinity_enabled,
-                controller,
-                progress_handler,
-                task_key,
-            )
-        if controller.cancelled or controller.task_cancelled(task_key):
-            remove_partial_output(task)
-            detail = "批处理已取消" if controller.cancelled else "任务已取消 / 停止"
-            say(f"[取消] {label}：{detail}")
-            results.append((task, False, detail))
-            emit_event(
-                "task_done",
-                slot_id=slot.slot_id,
-                task_index=task_index,
-                status="cancelled",
-                source=str(task.source),
-                output=str(task.output),
-            )
-            continue
-        if code == 0:
-            kept_source, result_detail = preserve_source_when_output_is_larger(
-                task, settings
-            )
-            emit_event(
-                "task_verification_start",
-                slot_id=slot.slot_id,
-                task_index=task_index,
-                source=str(task.source),
-                output=str(task.output),
-                filename=task.label,
-            )
-            say(f"[校验] {label}：正在使用 GPU / NVDEC 完整解码最终视频流")
-            valid_output, validation_detail = validate_existing_output(
-                task.output,
-                task.info,
-                ffprobe,
-                ffmpeg,
-                settings.codec,
-                settings.resolution,
-                settings.fps_value,
-                controller,
-                None if task.is_clip else task.source,
-                validation_gpus or (slot.gpu,),
-                task_key,
-            )
-            if controller.cancelled or controller.task_cancelled(task_key):
-                remove_partial_output(task)
-                say(f"[取消] {label}：输出校验已取消")
-                detail = "批处理已取消" if controller.cancelled else "任务已取消 / 停止"
-                results.append((task, False, detail))
-                emit_event(
-                    "task_done",
-                    slot_id=slot.slot_id,
-                    task_index=task_index,
-                    status="cancelled",
-                    source=str(task.source),
-                    output=str(task.output),
-                )
-                continue
-            if not valid_output:
-                remove_partial_output(task)
-                detail = f"编码完成，但最终输出未通过 GPU 校验：{validation_detail}"
-                say(f"[失败] {label}\n{detail}")
-                results.append((task, False, detail))
-                completed_equivalent_frames += equivalent_frames
-                emit_event(
-                    "task_done",
-                    slot_id=slot.slot_id,
-                    task_index=task_index,
-                    status="failed",
-                    source=str(task.source),
-                    output=str(task.output),
-                    error=detail,
-                    completed_equivalent_frames=completed_equivalent_frames,
-                    queue_equivalent_frames=queue_equivalent_frames,
-                )
-                continue
-            result_detail = (
-                f"{result_detail}；{validation_detail}"
-                if result_detail
-                else validation_detail
-            )
-            if source_timestamps is not None:
-                try:
-                    apply_file_timestamps(task.output, source_timestamps)
-                except OSError as exc:
-                    warn(f"{label}：无法保留源文件的创建/修改时间：{exc}")
-                    timestamp_detail = f"无法保留源文件时间戳：{exc}"
-                    result_detail = (
-                        f"{result_detail}；{timestamp_detail}"
-                        if result_detail else timestamp_detail
-                    )
-            if kept_source:
-                say(f"[保留原文件] {label}：{result_detail} -> {task.output}")
-            else:
-                say(f"[完成] {label} -> {task.output}")
-            results.append((task, True, result_detail))
-            completed_equivalent_frames += equivalent_frames
-            emit_event(
-                "task_done",
-                slot_id=slot.slot_id,
-                task_index=task_index,
-                status="success",
-                source=str(task.source),
-                output=str(task.output),
-                input_size=task.source.stat().st_size if task.source.exists() else None,
-                output_size=task.output.stat().st_size if task.output.exists() else None,
-                kept_source=kept_source,
-                detail=result_detail,
-                completed_equivalent_frames=completed_equivalent_frames,
-                queue_equivalent_frames=queue_equivalent_frames,
-            )
-        else:
-            detail = error_tail(stderr_text) or f"FFmpeg 退出码 {code}"
-            say(f"[失败] {label}\n{detail}")
-            results.append((task, False, detail))
-            completed_equivalent_frames += equivalent_frames
-            emit_event(
-                "task_done",
-                slot_id=slot.slot_id,
-                task_index=task_index,
-                status="failed",
-                source=str(task.source),
-                output=str(task.output),
-                error=detail,
-                completed_equivalent_frames=completed_equivalent_frames,
-                queue_equivalent_frames=queue_equivalent_frames,
-            )
+        results.append(result)
+        if "取消" not in result[2]:
+            completed_equivalent_frames += task_equivalent_frames(task, settings)
     return results
 
 
@@ -2302,6 +2384,168 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+@dataclass
+class JobPlan:
+    """A fully validated, probed batch ready for slot assignment."""
+
+    tasks: list[VideoTask]
+    skipped_tasks: list[VideoTask]
+    all_tasks: list[VideoTask]
+    settings: EncodeSettings
+    usable_gpus: list[GpuCapability]
+    output_dir: Path | None
+    codec: str
+    container: str
+
+
+def task_plan_item(task: VideoTask, settings: EncodeSettings) -> dict[str, object]:
+    width, height, output_fps = task_output_geometry(task, settings)
+    return {
+        "source": str(task.source),
+        "output": str(task.output),
+        "filename": task.label,
+        "source_container": task.source.suffix.lstrip(".") or "未知",
+        "source_width": task.info.width,
+        "source_height": task.info.height,
+        "source_fps": task.info.fps,
+        "input_codec": task.info.codec,
+        "input_size": task_input_size(task) or None,
+        "total_frames": task_total_frames(task, settings),
+        "equivalent_frames": task_equivalent_frames(task, settings),
+        "width": width,
+        "height": height,
+        "fps": output_fps,
+        "duration": task.info.duration,
+        "external_id": task.external_id,
+    }
+
+
+def plan_cli_job(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+    raw_argv: Sequence[str],
+    controller: ProcessController | None = None,
+) -> JobPlan:
+    """Validate a parsed CLI request, probe inputs and build the real task list.
+
+    The argument namespace is updated in place (HLM defaults, resolved FFmpeg
+    paths), so both the CLI ``main`` and the GUI live scheduler reuse the exact
+    same planning behaviour.  ``parser.error`` remains the validation exit path.
+    """
+
+    def option_present(name: str) -> bool:
+        return any(argument == name or argument.startswith(f"{name}=") for argument in raw_argv)
+
+    if args.hlm and args.inputs:
+        parser.error("--hlm 不能与普通视频/目录输入混用")
+    if args.hlm_job and not args.hlm:
+        parser.error("--hlm-job 必须与 --hlm 一起使用")
+    hlm_document: dict | None = None
+    if args.hlm:
+        args.hlm = args.hlm.expanduser().resolve()
+        hlm_document = load_hlm_document(args.hlm)
+        defaults = hlm_processing_defaults(hlm_document, args.hlm)
+        if not option_present("--codec"):
+            args.codec = defaults["codec"]
+        if not option_present("--container"):
+            args.container = defaults["container"]
+        if not option_present("--output-dir"):
+            args.output_dir = defaults["output_dir"]
+        if not option_present("--overwrite"):
+            args.overwrite = defaults["overwrite"]
+        if not option_present("--no-subtitles"):
+            args.no_subtitles = not defaults["copy_subtitles"]
+    elif not args.inputs:
+        parser.error("至少需要一个输入文件/目录或 --hlm（也可使用 --doctor）")
+    if not 0 <= args.cq <= 51:
+        parser.error("--cq 必须在 0 到 51 之间")
+    if not 0 <= args.lookahead <= 32:
+        parser.error("--lookahead 必须在 0 到 32 之间")
+    codec = "hevc" if args.codec == "nvhevc" else args.codec
+    args.ffmpeg, args.ffprobe = resolve_ffmpeg_toolchain(
+        args.ffmpeg,
+        args.ffprobe,
+        explicit_ffmpeg=option_present("--ffmpeg"),
+        explicit_ffprobe=option_present("--ffprobe"),
+    )
+    verify_ffmpeg_encoder(args.ffmpeg, codec)
+    gpus = load_gpu_config(args.gpu_config.resolve())
+    detected = detect_nvidia_gpus(args.nvidia_smi)
+    selected = set(args.gpu) if args.gpu is not None else None
+    usable_gpus = validate_configured_gpus(gpus, detected, selected)
+
+    output_dir = args.output_dir.expanduser().resolve() if args.output_dir else None
+    fps_text, fps_value = args.fps if args.fps else (None, None)
+    settings = EncodeSettings(
+        codec=codec,
+        maxrate=args.maxrate,
+        bufsize=args.bufsize,
+        fps_text=fps_text,
+        fps_value=fps_value,
+        resolution=args.resolution,
+        cq=args.cq,
+        preset=args.preset,
+        lookahead=args.lookahead,
+        multipass=args.multipass,
+        overwrite=args.overwrite,
+        copy_subtitles=not args.no_subtitles,
+    )
+    if hlm_document is not None:
+        all_tasks = make_hlm_tasks(
+            hlm_document,
+            args.hlm,
+            output_dir,
+            codec,
+            args.container,
+            args.ffprobe,
+            args.ffmpeg,
+            args.overwrite,
+            controller,
+            settings.resolution,
+            settings.fps_value,
+            usable_gpus,
+            args.hlm_job,
+        )
+    else:
+        inputs = expand_inputs(args.inputs, args.recursive)
+        all_tasks = make_tasks(
+            inputs,
+            output_dir,
+            codec,
+            args.container,
+            args.ffprobe,
+            args.ffmpeg,
+            args.overwrite,
+            controller,
+            settings.resolution,
+            settings.fps_value,
+            usable_gpus,
+        )
+    skipped_tasks = [task for task in all_tasks if task.skip_reason]
+    tasks = [task for task in all_tasks if not task.skip_reason]
+    for task in skipped_tasks:
+        say(
+            f"[跳过] {task.label}：{task.skip_reason}：{task.output}；"
+            "使用 --overwrite 可重新压制"
+        )
+    for task in all_tasks:
+        if task.overwrite_existing:
+            warn(
+                f"[重做] {task.label}：已有输出未通过有效性检查，"
+                f"将自动覆盖：{task.replacement_reason}"
+            )
+    return JobPlan(
+        tasks=tasks,
+        skipped_tasks=skipped_tasks,
+        all_tasks=all_tasks,
+        settings=settings,
+        usable_gpus=usable_gpus,
+        output_dir=output_dir,
+        codec=codec,
+        container=args.container,
+    )
+
+
 def main(
     argv: Sequence[str] | None = None,
     controller: ProcessController | None = None,
@@ -2309,9 +2553,6 @@ def main(
     parser = build_parser()
     raw_argv = list(argv) if argv is not None else sys.argv[1:]
     args = parser.parse_args(raw_argv)
-
-    def option_present(name: str) -> bool:
-        return any(argument == name or argument.startswith(f"{name}=") for argument in raw_argv)
 
     controller = controller or ProcessController()
     workers: list[threading.Thread] = []
@@ -2339,124 +2580,44 @@ def main(
             previous_signal_handlers[handled_signal] = signal.getsignal(handled_signal)
             signal.signal(handled_signal, handle_cancel_signal)
     try:
-        gpus = load_gpu_config(args.gpu_config.resolve())
         if args.doctor:
+            gpus = load_gpu_config(args.gpu_config.resolve())
+            args.ffmpeg, args.ffprobe = resolve_ffmpeg_toolchain(
+                args.ffmpeg,
+                args.ffprobe,
+                explicit_ffmpeg=any(
+                    argument == "--ffmpeg" or argument.startswith("--ffmpeg=")
+                    for argument in raw_argv
+                ),
+                explicit_ffprobe=any(
+                    argument == "--ffprobe" or argument.startswith("--ffprobe=")
+                    for argument in raw_argv
+                ),
+            )
             doctor(args.ffmpeg, args.ffprobe, args.nvidia_smi, gpus)
             return 0
-        if args.hlm and args.inputs:
-            parser.error("--hlm 不能与普通视频/目录输入混用")
-        if args.hlm_job and not args.hlm:
-            parser.error("--hlm-job 必须与 --hlm 一起使用")
-        hlm_document: dict | None = None
-        if args.hlm:
-            args.hlm = args.hlm.expanduser().resolve()
-            hlm_document = load_hlm_document(args.hlm)
-            defaults = hlm_processing_defaults(hlm_document, args.hlm)
-            if not option_present("--codec"):
-                args.codec = defaults["codec"]
-            if not option_present("--container"):
-                args.container = defaults["container"]
-            if not option_present("--output-dir"):
-                args.output_dir = defaults["output_dir"]
-            if not option_present("--overwrite"):
-                args.overwrite = defaults["overwrite"]
-            if not option_present("--no-subtitles"):
-                args.no_subtitles = not defaults["copy_subtitles"]
-        elif not args.inputs:
-            parser.error("至少需要一个输入文件/目录或 --hlm（也可使用 --doctor）")
-        if not 0 <= args.cq <= 51:
-            parser.error("--cq 必须在 0 到 51 之间")
-        if not 0 <= args.lookahead <= 32:
-            parser.error("--lookahead 必须在 0 到 32 之间")
-        codec = "hevc" if args.codec == "nvhevc" else args.codec
-        verify_ffmpeg_encoder(args.ffmpeg, codec)
-        detected = detect_nvidia_gpus(args.nvidia_smi)
-        selected = set(args.gpu) if args.gpu is not None else None
-        usable_gpus = validate_configured_gpus(gpus, detected, selected)
+        plan = plan_cli_job(parser, args, raw_argv, controller)
+        tasks = plan.tasks
+        skipped_tasks = plan.skipped_tasks
+        all_tasks = plan.all_tasks
+        settings = plan.settings
+        usable_gpus = plan.usable_gpus
+        codec = plan.codec
+        output_dir = plan.output_dir
         slots = create_slots(usable_gpus, codec)
-
-        output_dir = args.output_dir.expanduser().resolve() if args.output_dir else None
-        fps_text, fps_value = args.fps if args.fps else (None, None)
-        settings = EncodeSettings(
-            codec=codec,
-            maxrate=args.maxrate,
-            bufsize=args.bufsize,
-            fps_text=fps_text,
-            fps_value=fps_value,
-            resolution=args.resolution,
-            cq=args.cq,
-            preset=args.preset,
-            lookahead=args.lookahead,
-            multipass=args.multipass,
-            overwrite=args.overwrite,
-            copy_subtitles=not args.no_subtitles,
-        )
-        if hlm_document is not None:
-            all_tasks = make_hlm_tasks(
-                hlm_document,
-                args.hlm,
-                output_dir,
-                codec,
-                args.container,
-                args.ffprobe,
-                args.ffmpeg,
-                args.overwrite,
-                controller,
-                settings.resolution,
-                settings.fps_value,
-                usable_gpus,
-                args.hlm_job,
-            )
-        else:
-            inputs = expand_inputs(args.inputs, args.recursive)
-            all_tasks = make_tasks(
-                inputs,
-                output_dir,
-                codec,
-                args.container,
-                args.ffprobe,
-                args.ffmpeg,
-                args.overwrite,
-                controller,
-                settings.resolution,
-                settings.fps_value,
-                usable_gpus,
-            )
-        skipped_tasks = [task for task in all_tasks if task.skip_reason]
-        tasks = [task for task in all_tasks if not task.skip_reason]
-        for task in skipped_tasks:
-            say(
-                f"[跳过] {task.label}：{task.skip_reason}：{task.output}；"
-                "使用 --overwrite 可重新压制"
-            )
-        for task in all_tasks:
-            if task.overwrite_existing:
-                warn(
-                    f"[重做] {task.label}：已有输出未通过有效性检查，"
-                    f"将自动覆盖：{task.replacement_reason}"
-                )
         active_slots = schedule_tasks(tasks, slots, settings)
 
-        def task_plan_item(task: VideoTask) -> dict[str, object]:
-            width, height, output_fps = task_output_geometry(task, settings)
-            return {
-                "source": str(task.source),
-                "output": str(task.output),
-                "filename": task.label,
-                "source_container": task.source.suffix.lstrip(".") or "未知",
-                "source_width": task.info.width,
-                "source_height": task.info.height,
-                "source_fps": task.info.fps,
-                "input_codec": task.info.codec,
-                "input_size": task_input_size(task) or None,
-                "total_frames": task_total_frames(task, settings),
-                "equivalent_frames": task_equivalent_frames(task, settings),
-                "width": width,
-                "height": height,
-                "fps": output_fps,
-                "duration": task.info.duration,
-                "external_id": task.external_id,
-            }
+        ordered_tasks: list[dict[str, object]] = []
+        max_queue = max((len(slot.tasks) for slot in active_slots), default=0)
+        for queue_index in range(max_queue):
+            for slot in sorted(active_slots, key=lambda item: item.slot_id):
+                if queue_index < len(slot.tasks):
+                    ordered_tasks.append(
+                        {
+                            **task_plan_item(slot.tasks[queue_index], settings),
+                            "slot_id": slot.slot_id,
+                        }
+                    )
 
         plan_slots = []
         for slot in active_slots:
@@ -2469,19 +2630,20 @@ def main(
                     "queue_equivalent_frames": sum(
                         task_equivalent_frames(task, settings) for task in slot.tasks
                     ),
-                    "tasks": [task_plan_item(task) for task in slot.tasks],
+                    "tasks": [task_plan_item(task, settings) for task in slot.tasks],
                 }
             )
         emit_event(
             "plan",
             slots=plan_slots,
+            ordered_tasks=ordered_tasks,
             display_slots=max(4 if args.debug_progress else 0, len(active_slots)),
             total_equivalent_frames=sum(
                 task_equivalent_frames(task, settings) for task in tasks
             ),
             task_count=len(tasks),
             skipped_count=len(skipped_tasks),
-            skipped_tasks=[task_plan_item(task) for task in skipped_tasks],
+            skipped_tasks=[task_plan_item(task, settings) for task in skipped_tasks],
         )
         emit_event("status", text=f"任务已安排，正在启动 {len(active_slots)} 个编码槽……")
 
@@ -2609,8 +2771,9 @@ def main(
             signal.signal(handled_signal, previous_handler)
 
 
-from PySide6.QtCore import QPoint, Qt, QTimer, QUrl, Signal, QObject
-from PySide6.QtGui import QColor, QDesktopServices, QFont, QIcon, QPalette
+from PySide6.QtCore import QByteArray, QMimeData, QPoint, Qt, QTimer, QUrl, Signal, QObject
+from PySide6.QtGui import QColor, QDesktopServices, QDrag, QFont, QIcon, QPalette
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -2656,6 +2819,860 @@ APP_DATA_DIR = (
 APP_LOG_DIR = APP_DATA_DIR / "logs"
 APP_LOG_PATH = APP_LOG_DIR / "CodecFoundry.log"
 APP_SETTINGS_PATH = APP_DATA_DIR / "settings.json"
+
+# ======================================================================
+# FFmpeg / ffprobe runtime provisioning
+#
+# CodecFoundry always prefers its own FFmpeg build installed under
+# %APPDATA%\CodecFoundry\ffmpeg (never touching C:\Windows or the system
+# PATH).  Anything older than 5.1 cannot parse ``-fps_mode`` and would fail
+# with "Unrecognized option 'fps_mode'".
+# ======================================================================
+
+MIN_FFMPEG_VERSION = (5, 1)
+FFMPEG_INSTALL_DIR = APP_DATA_DIR / "ffmpeg"
+# Domestic download source and archive layout follow CPVC exactly.
+FFMPEG_DOWNLOAD_BASE_URL = (
+    "https://gitee.com/otreee/ffmpeg_build/releases/download/2026-02-09-git-9bfa1635ae"
+)
+FFMPEG_DOWNLOAD_ARCHIVES = {
+    "ffmpeg.zip": "ffmpeg.exe",
+    "ffprobe.zip": "ffprobe.exe",
+}
+FFMPEG_RELEASES_PAGE_URL = "https://gitee.com/otreee/ffmpeg_build/releases"
+FFMPEG_DOWNLOAD_RETRIES = 5
+FFMPEG_INSTALL_RETRY_SECONDS = 10 * 60
+
+_ffmpeg_runtime_lock = threading.Lock()
+_ffmpeg_runtime_cache: tuple[Path, Path] | None = None
+
+
+def _ffmpeg_binary_names() -> tuple[str, str]:
+    suffix = ".exe" if os.name == "nt" else ""
+    return f"ffmpeg{suffix}", f"ffprobe{suffix}"
+
+
+def _tool_version_tuple(executable: Path | str) -> tuple[int, int, int, int] | None:
+    try:
+        completed = run_captured_text([str(executable), "-version"])
+    except OSError:
+        return None
+    if completed.returncode != 0:
+        return None
+    lines = completed.stdout.splitlines()
+    first_line = lines[0] if lines else ""
+    return _version_tuple(first_line)
+
+
+def ffmpeg_version_ok(executable: Path | str) -> bool:
+    """Return True when the executable runs and is new enough for -fps_mode."""
+    version = _tool_version_tuple(executable)
+    return version is not None and version >= MIN_FFMPEG_VERSION
+
+
+def _emit_ffmpeg_setup(stage: str, name: str = "", detail: str = "", progress: float | None = None) -> None:
+    payload: dict[str, object] = {"stage": stage, "name": name, "detail": detail}
+    if progress is not None:
+        payload["progress"] = progress
+    emit_event("ffmpeg_setup", **payload)
+    if stage == "download" and progress is not None:
+        say(f"[FFmpeg] 正在下载 {name} … {progress * 100:.0f}%")
+    elif detail:
+        say(f"[FFmpeg] {detail}")
+
+
+def _download_ffmpeg_archive(url: str, save_path: Path, retries: int, progress_callback=None) -> bool:
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0.0.0 Safari/537.36"
+        ),
+        "Referer": "https://gitee.com/",
+    }
+    for attempt in range(1, retries + 1):
+        try:
+            request = Request(url, headers=headers)
+            with urlopen(request, timeout=60) as response, open(save_path, "wb") as output:
+                total_size = int(response.headers.get("Content-Length") or 0)
+                downloaded = 0
+                while True:
+                    chunk = response.read(128 * 1024)
+                    if not chunk:
+                        break
+                    output.write(chunk)
+                    downloaded += len(chunk)
+                    if progress_callback:
+                        progress_callback(downloaded, total_size)
+            return True
+        except Exception as exc:
+            warn(f"[FFmpeg] 下载失败（第 {attempt}/{retries} 次）：{url}：{exc}")
+            try:
+                save_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            if attempt >= retries:
+                return False
+            time.sleep(min(2 ** attempt, 20))
+    return False
+
+
+def _find_file_in_tree(search_root: Path, file_name: str) -> Path | None:
+    try:
+        for root, _directories, files in os.walk(search_root):
+            if file_name in files:
+                return Path(root) / file_name
+    except OSError:
+        return None
+    return None
+
+
+def _adopt_ffmpeg_from_path(install_dir: Path) -> bool:
+    """Reuse an already-installed, sufficiently new FFmpeg by copying it in."""
+    adopted = False
+    for tool_name in ("ffmpeg", "ffprobe"):
+        target_name = f"{tool_name}.exe" if os.name == "nt" else tool_name
+        target = install_dir / target_name
+        if ffmpeg_version_ok(target):
+            continue
+        found = shutil.which(tool_name)
+        if found and ffmpeg_version_ok(Path(found)):
+            try:
+                shutil.copy2(found, target)
+                adopted = True
+                say(f"[FFmpeg] 已把可用的 {target_name} 复制到应用目录")
+            except OSError as exc:
+                warn(f"[FFmpeg] 复制 {found} 失败：{exc}")
+    ffmpeg_name, ffprobe_name = _ffmpeg_binary_names()
+    return ffmpeg_version_ok(install_dir / ffmpeg_name) and ffmpeg_version_ok(
+        install_dir / ffprobe_name
+    )
+
+
+def _install_ffmpeg_binaries(install_dir: Path) -> bool:
+    if _adopt_ffmpeg_from_path(install_dir):
+        return True
+    marker = install_dir / ".install_failed"
+    if marker.is_file():
+        try:
+            age = time.time() - marker.stat().st_mtime
+        except OSError:
+            age = FFMPEG_INSTALL_RETRY_SECONDS
+        if age < FFMPEG_INSTALL_RETRY_SECONDS:
+            warn("[FFmpeg] 自动安装最近失败过，本次跳过重复下载；"
+                 f"可删除 {marker.name} 后重试")
+            return False
+    say(f"[FFmpeg] 正在从国内镜像下载（{FFMPEG_DOWNLOAD_BASE_URL}）……")
+    for archive, binary in FFMPEG_DOWNLOAD_ARCHIVES.items():
+        target = install_dir / binary
+        if ffmpeg_version_ok(target):
+            continue
+        download_url = f"{FFMPEG_DOWNLOAD_BASE_URL}/{archive}"
+        archive_path = install_dir / archive
+
+        def progress(done: int, total: int) -> None:
+            _emit_ffmpeg_setup(
+                "download",
+                name=archive,
+                progress=(done / total) if total > 0 else None,
+            )
+
+        if not _download_ffmpeg_archive(download_url, archive_path, FFMPEG_DOWNLOAD_RETRIES, progress):
+            continue
+        try:
+            _emit_ffmpeg_setup("extract", name=archive, detail=f"正在解压 {archive}")
+            extract_dir = install_dir / ".extract"
+            shutil.rmtree(extract_dir, ignore_errors=True)
+            with ZipFile(archive_path) as zip_file:
+                zip_file.extractall(extract_dir)
+            extracted = _find_file_in_tree(extract_dir, binary)
+            if extracted is None:
+                warn(f"[FFmpeg] 压缩包中没有找到 {binary}")
+                continue
+            try:
+                target.unlink(missing_ok=True)
+            except OSError:
+                pass
+            shutil.move(str(extracted), str(target))
+            shutil.rmtree(extract_dir, ignore_errors=True)
+        except (OSError, BadZipFile) as exc:
+            warn(f"[FFmpeg] 解压/安装 {binary} 失败：{exc}")
+        finally:
+            try:
+                archive_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        if ffmpeg_version_ok(target):
+            say(f"[FFmpeg] 已安装 {binary}")
+    ffmpeg_name, ffprobe_name = _ffmpeg_binary_names()
+    success = ffmpeg_version_ok(install_dir / ffmpeg_name) and ffmpeg_version_ok(
+        install_dir / ffprobe_name
+    )
+    if not success:
+        try:
+            marker.touch()
+        except OSError:
+            pass
+    return success
+
+
+def ensure_ffmpeg_runtime() -> tuple[Path, Path]:
+    """Return CodecFoundry-owned FFmpeg/ffprobe, installing them when needed.
+
+    Raises TranscodeError only when no usable FFmpeg can be provided at all.
+    """
+    global _ffmpeg_runtime_cache
+    with _ffmpeg_runtime_lock:
+        if _ffmpeg_runtime_cache is not None:
+            return _ffmpeg_runtime_cache
+        ffmpeg_name, ffprobe_name = _ffmpeg_binary_names()
+        install_dir = FFMPEG_INSTALL_DIR
+        try:
+            install_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise TranscodeError(f"无法创建 FFmpeg 安装目录 {install_dir}：{exc}") from exc
+        ffmpeg_exe = install_dir / ffmpeg_name
+        ffprobe_exe = install_dir / ffprobe_name
+        if not (ffmpeg_version_ok(ffmpeg_exe) and ffmpeg_version_ok(ffprobe_exe)):
+            _emit_ffmpeg_setup(
+                "start",
+                detail="本地 FFmpeg 缺失或版本过旧（需要 >= 5.1 以支持 -fps_mode），正在自动修复",
+            )
+            _install_ffmpeg_binaries(install_dir)
+        if ffmpeg_version_ok(ffmpeg_exe) and ffmpeg_version_ok(ffprobe_exe):
+            _emit_ffmpeg_setup("done", detail="应用自带 FFmpeg 已就绪")
+            _ffmpeg_runtime_cache = (ffmpeg_exe, ffprobe_exe)
+            return _ffmpeg_runtime_cache
+        # Last resort: a sufficiently new system FFmpeg, used with a warning.
+        path_ffmpeg = shutil.which("ffmpeg")
+        path_ffprobe = shutil.which("ffprobe")
+        if (
+            path_ffmpeg
+            and path_ffprobe
+            and ffmpeg_version_ok(path_ffmpeg)
+            and ffmpeg_version_ok(path_ffprobe)
+        ):
+            warn("FFmpeg 自动安装失败；本次临时使用系统 PATH 中的新版本 FFmpeg（应用目录版本优先）")
+            _ffmpeg_runtime_cache = (Path(path_ffmpeg), Path(path_ffprobe))
+            return _ffmpeg_runtime_cache
+        emit_event(
+            "ffmpeg_failed",
+            detail="缺少可用 FFmpeg（需要 >= 5.1）",
+            page=FFMPEG_RELEASES_PAGE_URL,
+            install_dir=str(install_dir),
+        )
+        raise TranscodeError(
+            "缺少可用的 FFmpeg/ffprobe（需要 >= 5.1 以支持 -fps_mode）。\n"
+            f"自动安装目录：{install_dir}\n"
+            "请检查网络后重试，或手动从下载页取得 ffmpeg.exe / ffprobe.exe 放入该目录。"
+        )
+
+
+def resolve_ffmpeg_toolchain(
+    default_ffmpeg: str,
+    default_ffprobe: str,
+    explicit_ffmpeg: bool = False,
+    explicit_ffprobe: bool = False,
+) -> tuple[str, str]:
+    """Pick FFmpeg/ffprobe paths: explicit CLI paths win, otherwise own builds."""
+    if explicit_ffmpeg and explicit_ffprobe:
+        return str(default_ffmpeg), str(default_ffprobe)
+    ffmpeg_exe, ffprobe_exe = ensure_ffmpeg_runtime()
+    return (
+        str(default_ffmpeg) if explicit_ffmpeg else str(ffmpeg_exe),
+        str(default_ffprobe) if explicit_ffprobe else str(ffprobe_exe),
+    )
+
+
+# ======================================================================
+# Update checking: update.json first, GitHub/Gitee Releases as fallback
+# ======================================================================
+
+UPDATE_INFO_URLS = [
+    "https://gitee.com/otreee/CodecFoundry/raw/main/update.json",
+    "https://raw.githubusercontent.com/YCTS-otree/CodecFoundry/main/update.json",
+]
+RELEASE_INFO_URLS = [
+    "https://gitee.com/api/v5/repos/otreee/CodecFoundry/releases/latest",
+    "https://api.github.com/repos/YCTS-otree/CodecFoundry/releases/latest",
+]
+UPDATE_HTTP_TIMEOUT = 2.0
+UPDATE_RELEASE_TIMEOUT = 5.0
+UPDATE_USER_AGENT = f"CodecFoundry-Updater/{CODECFOUNDRY_VERSION}"
+FALLBACK_RELEASE_NOTES = "修复BUG"
+
+_update_sources_reachable = False
+
+
+def _fetch_update_json(url: str, timeout: float, accept_header: str | None = None) -> dict | None:
+    global _update_sources_reachable
+    headers = {"User-Agent": UPDATE_USER_AGENT, "Cache-Control": "no-cache"}
+    if accept_header:
+        headers["Accept"] = accept_header
+    try:
+        request = Request(url, headers=headers)
+        with urlopen(request, timeout=timeout) as response:
+            payload = response.read().decode("utf-8", errors="replace")
+        _update_sources_reachable = True
+        if not payload.strip():
+            return None
+        data = json.loads(payload)
+        return data if isinstance(data, dict) else None
+    except (URLError, HTTPError, TimeoutError, OSError, json.JSONDecodeError, ValueError) as exc:
+        say(f"[更新] 拉取/解析更新信息失败：{url}（{exc}）")
+        return None
+    except Exception as exc:
+        say(f"[更新] 读取更新信息失败：{url}（{exc}）")
+        return None
+
+
+def _normalize_download_pages(data: dict) -> list[str]:
+    if isinstance(data.get("download_pages"), list):
+        return [str(item).strip() for item in data["download_pages"] if str(item).strip()]
+    download_page = data.get("download_page")
+    if isinstance(download_page, list):
+        return [str(item).strip() for item in download_page if str(item).strip()]
+    if isinstance(download_page, str) and download_page.strip():
+        return [download_page.strip()]
+    return []
+
+
+def _version_key(version_text: object) -> tuple[int, ...]:
+    version_text = str(version_text or "").strip().lstrip("vV")
+    if not version_text:
+        return tuple()
+    parts = version_text.replace("-", ".").replace("_", ".").split(".")
+    result: list[int] = []
+    for part in parts:
+        digits = "".join(ch for ch in part if ch.isdigit())
+        result.append(int(digits) if digits else 0)
+    return tuple(result)
+
+
+def _is_newer_version(latest: object, current: object) -> bool:
+    latest_key = _version_key(latest)
+    current_key = _version_key(current)
+    if latest_key and current_key:
+        return latest_key > current_key
+    return str(latest).strip() != str(current).strip()
+
+
+def _get_update_json_info() -> dict | None:
+    for update_url in UPDATE_INFO_URLS:
+        data = _fetch_update_json(update_url, UPDATE_HTTP_TIMEOUT)
+        if not data:
+            continue
+        latest = str(data.get("latest", "")).strip()
+        download_pages = _normalize_download_pages(data)
+        if latest and download_pages:
+            notes = data.get("notes")
+            return {
+                "latest": latest,
+                "published": str(data.get("published", "")).strip(),
+                "notes": notes if isinstance(notes, list) else [],
+                "download_pages": download_pages,
+                "source": update_url,
+            }
+        say(f"[更新] update.json 字段不完整，忽略：{update_url}")
+    return None
+
+
+def _get_latest_release_info() -> dict | None:
+    for release_url in RELEASE_INFO_URLS:
+        accept = "application/vnd.github+json" if "api.github.com" in release_url else None
+        data = _fetch_update_json(release_url, UPDATE_RELEASE_TIMEOUT, accept_header=accept)
+        if not data:
+            continue
+        tag = str(data.get("tag_name") or "").strip().lstrip("vV")
+        html_url = str(data.get("html_url") or "").strip()
+        if not tag or not html_url:
+            continue
+        body = data.get("body")
+        if isinstance(body, str) and body.strip():
+            notes: list[str] = [body.strip()]
+        else:
+            notes = [FALLBACK_RELEASE_NOTES]
+        return {
+            "latest": tag,
+            "published": str(data.get("published_at") or data.get("created_at") or "").strip(),
+            "notes": notes,
+            "download_pages": [html_url],
+            "source": release_url,
+            "from_release": True,
+        }
+    return None
+
+
+def check_for_updates(current_version: str | None = None) -> dict | None:
+    """Return update info when a newer version exists, else None.
+
+    update.json 是正常路径；不存在、请求失败、内容为空或解析失败时，回退到
+    GitHub（含 Gitee 镜像）最新 Release tag 检查。
+    """
+    global _update_sources_reachable
+    _update_sources_reachable = False
+    current_version = current_version or CODECFOUNDRY_VERSION
+    info = _get_update_json_info()
+    if info is None:
+        info = _get_latest_release_info()
+    if not info or not _is_newer_version(info["latest"], current_version):
+        return None
+    return info
+
+
+def update_sources_reachable() -> bool:
+    """Whether at least one update source responded during the last check."""
+    return _update_sources_reachable
+
+
+def update_notes_text(info: dict) -> str:
+    notes = info.get("notes")
+    if isinstance(notes, list) and notes:
+        lines = [str(line).strip() for line in notes if str(line).strip()]
+        if lines:
+            return "\n".join(f"{index}. {line}" for index, line in enumerate(lines, 1))
+    if isinstance(notes, str) and notes.strip():
+        return notes.strip()
+    return FALLBACK_RELEASE_NOTES
+
+
+# ======================================================================
+# Live scheduler: persistent intake queue shared by the GUI, FC IPC and
+# single-instance forwarding.  New requests are appended to the real
+# waiting queue and dispatched to free NVENC slots in user-visible order.
+# ======================================================================
+
+
+@dataclass
+class PendingTaskItem:
+    task: VideoTask
+    settings: EncodeSettings
+    preferred_slot: int
+    ffmpeg: str
+    ffprobe: str
+    affinity_enabled: bool
+    software_fallback: bool
+    validation_gpus: tuple[GpuCapability, ...]
+
+
+@dataclass
+class SchedulerRequest:
+    argv: list[str]
+    fresh: bool
+
+
+def plan_task_assignment(
+    tasks: Sequence[VideoTask],
+    slots: Sequence[EncoderSlot],
+    settings: EncodeSettings,
+    initial_loads: dict[int, float] | None = None,
+) -> list[tuple[VideoTask, EncoderSlot]]:
+    """LPT assignment onto already-loaded slots; returns (task, slot) pairs."""
+    loads = {
+        slot.slot_id: (float(initial_loads.get(slot.slot_id, 0.0)) if initial_loads else 0.0)
+        for slot in slots
+    }
+    queued = {slot.slot_id: 0 for slot in slots}
+    weighted = sorted(
+        (
+            (scheduling_workload(task, settings), position, task)
+            for position, task in enumerate(tasks)
+        ),
+        key=lambda item: (-item[0], item[1]),
+    )
+    pairs: list[tuple[VideoTask, EncoderSlot]] = []
+    for workload, _position, task in weighted:
+        chosen = min(
+            slots,
+            key=lambda slot: (
+                loads[slot.slot_id]
+                + workload * (1.0 if slot.gpu.can_decode(task.info.codec) else 1.05),
+                loads[slot.slot_id],
+                queued[slot.slot_id],
+                slot.gpu.index,
+                slot.engine,
+            ),
+        )
+        loads[chosen.slot_id] += workload
+        queued[chosen.slot_id] += 1
+        pairs.append((task, chosen))
+    return pairs
+
+
+class LiveScheduler:
+    """Dispatch waiting tasks to NVENC slots while accepting new requests.
+
+    Waiting tasks form one ordered list: it is the visible queue order in the
+    GUI sidebar and the order in which free slots take their next task, so a
+    drag-reorder changes real scheduling, not just display.  Each finished
+    chunk (until the queue drains) produces one compression report.
+    """
+
+    def __init__(self, controller: ProcessController) -> None:
+        self.controller = controller
+        self.lock = threading.Lock()
+        self.waiting: list[PendingTaskItem] = []
+        self.waiting_keys: set[str] = set()
+        self.busy: dict[int, PendingTaskItem] = {}
+        self.busy_threads: set[threading.Thread] = set()
+        self.slots: list[EncoderSlot] = []
+        self.slots_by_codec: dict[str, list[EncoderSlot]] = {}
+        self._next_slot_id = 0
+        self.completed_work = 0.0
+        self.remaining_work = 0.0
+        self.completed_count = 0
+        self.debug_progress = False
+        self._plan_emitted = False
+        self.shutdown = False
+        self.chunk_results: list[tuple[VideoTask, bool, str]] = []
+        self.chunk_tasks: list[VideoTask] = []
+        self.chunk_skipped: list[VideoTask] = []
+        self.chunk_settings: list[EncodeSettings] = []
+        self.chunk_started: datetime | None = None
+        self.wakeup = threading.Event()
+
+    # -- scheduling core -------------------------------------------------
+
+    def _ensure_slots_locked(self, gpus: Sequence[GpuCapability], codec: str) -> bool:
+        if codec in self.slots_by_codec:
+            return False
+        new_slots = create_slots(gpus, codec)
+        for slot in new_slots:
+            slot.slot_id = self._next_slot_id
+            self._next_slot_id += 1
+        self.slots_by_codec[codec] = new_slots
+        self.slots.extend(new_slots)
+        self._reassign_cpu_ids_locked()
+        return True
+
+    def _reassign_cpu_ids_locked(self) -> None:
+        cpu_count = os.cpu_count() or 1
+        addressable = (
+            min(cpu_count, ctypes.sizeof(ctypes.c_size_t) * 8)
+            if os.name == "nt"
+            else cpu_count
+        )
+        cores = list(range(addressable))
+        for position, slot in enumerate(self.slots):
+            slot.cpu_ids = tuple(cores[position::len(self.slots)]) or (
+                cores[position % len(cores)],
+            )
+
+    def _slot_meta(self) -> list[dict[str, object]]:
+        return [
+            {
+                "slot_id": slot.slot_id,
+                "gpu_index": slot.gpu.index,
+                "engine": slot.engine,
+                "cpu_ids": list(slot.cpu_ids),
+                "codec": slot.codec,
+                "tasks": [],
+            }
+            for slot in self.slots
+        ]
+
+    def _pending_item_plan(self, item: PendingTaskItem) -> dict[str, object]:
+        return {**task_plan_item(item.task, item.settings), "slot_id": item.preferred_slot}
+
+    def _append_request_locked(
+        self, plan: JobPlan, args: argparse.Namespace, fresh: bool
+    ) -> None:
+        created_slots = self._ensure_slots_locked(plan.usable_gpus, plan.codec)
+        codec_slots = self.slots_by_codec[plan.codec]
+        loads: dict[int, float] = {slot.slot_id: 0.0 for slot in codec_slots}
+        for item in self.waiting:
+            if item.settings.codec == plan.codec and item.preferred_slot in loads:
+                loads[item.preferred_slot] += task_equivalent_frames(item.task, item.settings)
+        for item in self.busy.values():
+            if item.settings.codec == plan.codec and item.preferred_slot in loads:
+                loads[item.preferred_slot] += task_equivalent_frames(item.task, item.settings)
+        pairs = plan_task_assignment(plan.tasks, codec_slots, plan.settings, loads)
+        busy_keys = {str(item.task.output) for item in self.busy.values()}
+        new_items: list[PendingTaskItem] = []
+        duplicates = 0
+        for task, slot in pairs:
+            task_key = str(task.output)
+            if task_key in self.waiting_keys or task_key in busy_keys:
+                duplicates += 1
+                continue
+            item = PendingTaskItem(
+                task=task,
+                settings=plan.settings,
+                preferred_slot=slot.slot_id,
+                ffmpeg=args.ffmpeg,
+                ffprobe=args.ffprobe,
+                affinity_enabled=not args.no_cpu_affinity,
+                software_fallback=not args.no_software_fallback,
+                validation_gpus=tuple(plan.usable_gpus),
+            )
+            self.waiting.append(item)
+            self.waiting_keys.add(task_key)
+            self.remaining_work += task_equivalent_frames(task, plan.settings)
+            new_items.append(item)
+        if duplicates:
+            warn(f"[队列] {duplicates} 个任务与现有队列的输出路径重复，已忽略")
+        self.debug_progress = self.debug_progress or bool(args.debug_progress)
+        self.chunk_tasks.extend(plan.all_tasks)
+        self.chunk_skipped.extend(plan.skipped_tasks)
+        self.chunk_settings.append(plan.settings)
+        if self.chunk_started is None:
+            self.chunk_started = datetime.now()
+        if created_slots:
+            emit_event("slots_changed", slots=self._slot_meta())
+        skipped_plan = [task_plan_item(task, plan.settings) for task in plan.skipped_tasks]
+        added_work = sum(
+            task_equivalent_frames(task, plan.settings) for task in plan.tasks
+        )
+        if fresh or not self._plan_emitted:
+            self._plan_emitted = True
+            emit_event(
+                "plan",
+                slots=self._slot_meta(),
+                ordered_tasks=[self._pending_item_plan(item) for item in self.waiting],
+                display_slots=max(4 if self.debug_progress else 0, len(self.slots)),
+                total_equivalent_frames=self.remaining_work,
+                task_count=len(self.chunk_tasks) - len(self.chunk_skipped),
+                skipped_count=len(self.chunk_skipped),
+                skipped_tasks=skipped_plan,
+            )
+        else:
+            emit_event(
+                "tasks_added",
+                ordered_tasks=[self._pending_item_plan(item) for item in new_items],
+                skipped_tasks=skipped_plan,
+                skipped_count=len(plan.skipped_tasks),
+                total_equivalent_frames=added_work,
+            )
+
+    def process_request(self, request: SchedulerRequest) -> None:
+        parser = build_parser()
+        argv = list(request.argv)
+        # The detached GUI console sets sys.stderr to None; argparse writes usage
+        # there on parse errors.  Give it a discard buffer for this call only.
+        saved_stderr = sys.stderr
+        if saved_stderr is None:
+            sys.stderr = io.StringIO()
+        try:
+            args = parser.parse_args(argv)
+            plan = plan_cli_job(parser, args, argv, self.controller)
+        finally:
+            sys.stderr = saved_stderr
+        with self.lock:
+            if self.shutdown:
+                return
+            self._append_request_locked(plan, args, request.fresh)
+        self.wakeup.set()
+
+    def _take_next_locked(self, slot: EncoderSlot) -> PendingTaskItem | None:
+        for index, item in enumerate(self.waiting):
+            if slot.codec == item.settings.codec:
+                self.waiting.pop(index)
+                self.waiting_keys.discard(str(item.task.output))
+                return item
+        return None
+
+    def dispatch(self) -> None:
+        with self.lock:
+            if self.shutdown:
+                return
+            for slot in list(self.slots):
+                if slot.slot_id in self.busy:
+                    continue
+                item = self._take_next_locked(slot)
+                if item is None:
+                    continue
+                self.busy[slot.slot_id] = item
+                worker = threading.Thread(
+                    target=self._worker_thread,
+                    args=(slot, item),
+                    daemon=True,
+                    name=f"CodecFoundrySlot{slot.slot_id}",
+                )
+                self.busy_threads.add(worker)
+                worker.start()
+
+    def _account_finished(
+        self, item: PendingTaskItem, status: str | None
+    ) -> tuple[float, float]:
+        with self.lock:
+            if status in {"success", "failed"}:
+                equivalent = task_equivalent_frames(item.task, item.settings)
+                self.completed_work += equivalent
+                self.completed_count += 1
+                self.remaining_work = max(0.0, self.remaining_work - equivalent)
+            return self.completed_work, self.remaining_work
+
+    def _worker_thread(self, slot: EncoderSlot, item: PendingTaskItem) -> None:
+        slot_id = slot.slot_id
+        with self.lock:
+            view = QueueView(
+                task_index=self.completed_count,
+                queue_total=len(self.waiting) + len(self.busy),
+                queue_equivalent_frames=self.remaining_work,
+                completed_equivalent_frames=self.completed_work,
+            )
+        try:
+            result = encode_task(
+                slot,
+                item.task,
+                item.settings,
+                view,
+                item.ffmpeg,
+                item.affinity_enabled,
+                item.software_fallback,
+                self.controller,
+                item.ffprobe,
+                item.validation_gpus,
+                finish_hook=lambda status: self._account_finished(item, status),
+            )
+        except BaseException as exc:
+            say(f"[调度] 任务执行异常：{type(exc).__name__}: {exc}")
+            result = (item.task, False, f"调度异常：{type(exc).__name__}: {exc}")
+            self._account_finished(item, "failed")
+        with self.lock:
+            self.busy.pop(slot_id, None)
+            self.chunk_results.append(result)
+            self.busy_threads.discard(threading.current_thread())
+        self.wakeup.set()
+
+    # -- user-visible queue order ----------------------------------------
+
+    def reorder_waiting(self, ordered_keys: Sequence[str]) -> None:
+        """Apply a sidebar drag-reorder to the real waiting queue."""
+        with self.lock:
+            by_key = {str(item.task.output): item for item in self.waiting}
+            reordered: list[PendingTaskItem] = []
+            seen: set[str] = set()
+            for raw_key in ordered_keys:
+                key = str(raw_key)
+                item = by_key.get(key)
+                if item is not None and key not in seen:
+                    reordered.append(item)
+                    seen.add(key)
+            for item in self.waiting:
+                key = str(item.task.output)
+                if key not in seen:
+                    reordered.append(item)
+                    seen.add(key)
+            self.waiting = reordered
+
+    # -- lifecycle --------------------------------------------------------
+
+    def has_work(self) -> bool:
+        with self.lock:
+            return bool(self.waiting or self.busy)
+
+    def request_shutdown(self) -> None:
+        with self.lock:
+            self.shutdown = True
+        self.wakeup.set()
+
+    def _chunk_idle(self) -> bool:
+        with self.lock:
+            return bool(self.chunk_started) and not self.waiting and not self.busy
+
+    def _finalize_chunk(self) -> dict[str, object]:
+        with self.lock:
+            tasks = list(self.chunk_tasks)
+            skipped = list(self.chunk_skipped)
+            results = list(self.chunk_results)
+            settings_list = list(self.chunk_settings)
+            started = self.chunk_started
+            self.chunk_tasks = []
+            self.chunk_skipped = []
+            self.chunk_results = []
+            self.chunk_settings = []
+            self.chunk_started = None
+        results = results + [
+            (task, False, f"跳过：{task.skip_reason}") for task in skipped
+        ]
+        succeeded = [item for item in results if item[1]]
+        cancelled = [item for item in results if not item[1] and "取消" in item[2]]
+        skipped_items = [
+            item for item in results if not item[1] and item[2].startswith("跳过：")
+        ]
+        failed = [
+            item
+            for item in results
+            if not item[1] and "取消" not in item[2] and not item[2].startswith("跳过：")
+        ]
+        settings = settings_list[0] if len(set(settings_list)) == 1 else None
+        report_path: Path | None = None
+        if tasks:
+            try:
+                report_path = write_compression_report(
+                    tasks,
+                    results,
+                    settings,
+                    None,
+                    started or datetime.now(),
+                    datetime.now(),
+                )
+                say(f"压缩报告：{report_path}")
+            except (OSError, TypeError) as exc:
+                warn(f"无法写入压缩报告：{exc}")
+        say(
+            f"汇总：成功 {len(succeeded)}，失败 {len(failed)}，"
+            f"取消 {len(cancelled)}，跳过 {len(skipped_items)}"
+        )
+        return {
+            "success": len(succeeded),
+            "failed": len(failed),
+            "cancelled": len(cancelled),
+            "skipped": len(skipped_items),
+            "report_path": str(report_path) if report_path else None,
+        }
+
+    def scheduler_loop(self, intake: queue.Queue) -> int:
+        """Run until shutdown: merge requests, dispatch and finalize chunks."""
+        exit_code = 0
+        while True:
+            request: SchedulerRequest | None = None
+            try:
+                request = intake.get(timeout=0.25)
+            except queue.Empty:
+                request = None
+            with self.lock:
+                stop_now = self.shutdown and not self.busy
+            if request is not None:
+                try:
+                    self.process_request(request)
+                except SystemExit as exc:
+                    message = f"请求参数无效：{exc.code or exc}"
+                    say(message)
+                    emit_event("status", text=message)
+                except TranscodeError as exc:
+                    say(f"错误：{exc}")
+                    emit_event("status", text=f"错误：{exc}")
+            self.dispatch()
+            if stop_now:
+                with self.lock:
+                    for item in list(self.waiting):
+                        emit_event(
+                            "task_done",
+                            slot_id=item.preferred_slot,
+                            task_index=self.completed_count,
+                            status="cancelled",
+                            source=str(item.task.source),
+                            output=str(item.task.output),
+                        )
+                        self.chunk_results.append((item.task, False, "批处理已取消"))
+                    self.waiting.clear()
+                    self.waiting_keys.clear()
+                    self.remaining_work = 0.0
+                summary = self._finalize_chunk()
+                emit_event("batch_done", **summary)
+                exit_code = 130 if self.controller.cancelled else 0
+                break
+            if self._chunk_idle():
+                summary = self._finalize_chunk()
+                if summary.get("report_path"):
+                    emit_event("report", path=summary["report_path"])
+                emit_event("batch_done", **summary)
+                emit_event("session_idle", **summary)
+        return exit_code
+
+
 DEFAULT_PREFERENCES: dict[str, object] = {
     "codec": "HEVC（默认）",
     "cq": "23",
@@ -2676,6 +3693,7 @@ DEFAULT_PREFERENCES: dict[str, object] = {
     "logging_enabled": False,
     "log_max_entries": 8,
     "log_max_size_mb": 8,
+    "check_update_on_startup": True,
     "window_width": 1180,
     "window_height": 900,
     "window_maximized": False,
@@ -2839,6 +3857,7 @@ class BackendBridge(QObject):
     log_message = Signal(str)
     backend_event = Signal(str, object)
     finished = Signal(int)
+    update_result = Signal(str, object)
 
 
 class AppLogManager:
@@ -2914,6 +3933,168 @@ class DropInputList(QListWidget):
         paths = [url.toLocalFile() for url in event.mimeData().urls() if url.isLocalFile()]
         if paths:
             self.paths_dropped.emit(paths)
+            event.acceptProposedAction()
+            return
+        event.ignore()
+
+
+SINGLE_INSTANCE_SERVER_NAME = (
+    "CodecFoundry-" + hashlib.md5(str(APP_DATA_DIR).encode("utf-8")).hexdigest()[:12]
+)
+TASK_CARD_MIME = "application/x-codecfoundry-task"
+TASK_LONG_PRESS_MS = 380
+
+
+def _forward_to_running_instance(argv: Sequence[str], timeout_ms: int = 1500) -> bool:
+    """Send argv to an already running CodecFoundry; True when acknowledged."""
+    payload = json.dumps(
+        {"argv": [str(item) for item in argv if str(item) != "--cli"], "pid": os.getpid()},
+        ensure_ascii=False,
+    ).encode("utf-8")
+    socket = QLocalSocket()
+    socket.connectToServer(SINGLE_INSTANCE_SERVER_NAME)
+    if not socket.waitForConnected(timeout_ms):
+        return False
+    socket.write(payload)
+    socket.flush()
+    deadline = time.monotonic() + timeout_ms / 1000.0
+    if not socket.waitForBytesWritten(timeout_ms):
+        # Some environments fail the wait spuriously even though the kernel
+        # accepted the bytes; confirm against the real buffer state instead.
+        while time.monotonic() < deadline and socket.bytesToWrite() > 0:
+            socket.waitForBytesWritten(100)
+        if socket.bytesToWrite() > 0:
+            socket.disconnectFromServer()
+            return False
+    acknowledged = False
+    while time.monotonic() < deadline:
+        socket.waitForReadyRead(100)
+        if bytes(socket.readAll()).strip() == b"ok":
+            acknowledged = True
+            break
+        if socket.state() != QLocalSocket.LocalSocketState.ConnectedState:
+            break
+    socket.disconnectFromServer()
+    return acknowledged
+
+
+def acquire_single_instance(app_argv: Sequence[str]) -> tuple[QLocalServer | None, bool]:
+    """Become the single instance, or forward argv to the running one.
+
+    Returns ``(server, forwarded)``.  When ``forwarded`` is True the caller must
+    exit immediately; otherwise ``server`` is the live QLocalServer (None only
+    when the instance slot could not be claimed in this attempt).
+    """
+    server: QLocalServer | None = None
+    for attempt in range(2):
+        if attempt:
+            time.sleep(0.25)
+        if _forward_to_running_instance(app_argv, timeout_ms=1500 if attempt == 0 else 4000):
+            return None, True
+        if attempt == 0:
+            candidate = QLocalServer()
+            if candidate.listen(SINGLE_INSTANCE_SERVER_NAME):
+                server = candidate
+                break
+    return server, False
+
+
+def _cli_request_can_forward(argv: Sequence[str]) -> bool:
+    """Only real job requests (HLM/video inputs) are forwarded to a GUI instance."""
+    if any(flag in argv for flag in ("--version", "--help", "-h", "--doctor", "--dry-run")):
+        return False
+    return "--hlm" in argv or any(not str(item).startswith("-") for item in argv)
+
+
+class TaskCardFrame(QFrame):
+    """Queue card that starts a drag after a long press, reordering waiting tasks."""
+
+    reorder_requested = Signal(str, object)  # dragged key, target key or None
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+        self._task_key: str | None = None
+        self._draggable = False
+        self._drag_active = False
+        self._press_global: QPoint | None = None
+        self._press_timer = QTimer(self)
+        self._press_timer.setSingleShot(True)
+        self._press_timer.setInterval(TASK_LONG_PRESS_MS)
+        self._press_timer.timeout.connect(self._begin_drag)
+
+    def set_task_key(self, task_key: str) -> None:
+        self._task_key = task_key
+
+    def set_draggable(self, draggable: bool) -> None:
+        self._draggable = bool(draggable)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton and self._draggable:
+            self._press_global = event.globalPosition().toPoint()
+            self._press_timer.start()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._press_timer.isActive() and self._press_global is not None:
+            distance = (
+                event.globalPosition().toPoint() - self._press_global
+            ).manhattanLength()
+            if distance >= QApplication.startDragDistance():
+                self._press_timer.stop()
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        self._press_timer.stop()
+        super().mouseReleaseEvent(event)
+
+    def _begin_drag(self) -> None:
+        if not self._draggable or self._task_key is None or self._drag_active:
+            return
+        self._drag_active = True
+        drag = QDrag(self)
+        mime = QMimeData()
+        mime.setData(TASK_CARD_MIME, QByteArray(self._task_key.encode("utf-8")))
+        drag.setMimeData(mime)
+        drag.exec(Qt.DropAction.MoveAction)
+        self._drag_active = False
+
+    def dragEnterEvent(self, event) -> None:
+        if event.mimeData().hasFormat(TASK_CARD_MIME) and self._draggable:
+            event.acceptProposedAction()
+            return
+        event.ignore()
+
+    def dropEvent(self, event) -> None:
+        raw = bytes(event.mimeData().data(TASK_CARD_MIME))
+        dragged_key = raw.decode("utf-8", errors="replace")
+        if dragged_key and dragged_key != self._task_key:
+            self.reorder_requested.emit(dragged_key, self._task_key)
+            event.acceptProposedAction()
+            return
+        event.ignore()
+
+
+class TaskHostWidget(QWidget):
+    """Sidebar container accepting drops at the end of the waiting queue."""
+
+    reorder_requested = Signal(str, object)
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+
+    def dragEnterEvent(self, event) -> None:
+        if event.mimeData().hasFormat(TASK_CARD_MIME):
+            event.acceptProposedAction()
+            return
+        event.ignore()
+
+    def dropEvent(self, event) -> None:
+        raw = bytes(event.mimeData().data(TASK_CARD_MIME))
+        dragged_key = raw.decode("utf-8", errors="replace")
+        if dragged_key:
+            self.reorder_requested.emit(dragged_key, None)
             event.acceptProposedAction()
             return
         event.ignore()
@@ -3000,6 +4181,7 @@ class TitleBar(QWidget):
 
     def _help_menu(self) -> QMenu:
         menu = QMenu(self)
+        menu.addAction("检查更新…", self.host_window.check_for_updates_manual)
         menu.addAction("详细帮助", self.host_window.show_help)
         menu.addAction("关于 CodecFoundry", self.host_window.show_about)
         return menu
@@ -3104,7 +4286,10 @@ class SettingsDialog(QDialog):
         general_layout.setContentsMargins(14, 12, 14, 12)
         self.debug_check = QCheckBox("调试模式：显示 E0-E3")
         self.debug_check.setChecked(host.debug_progress_enabled)
+        self.update_check = QCheckBox("启动时自动检查更新")
+        self.update_check.setChecked(host.check_update_on_startup)
         general_layout.addWidget(self.debug_check)
+        general_layout.addWidget(self.update_check)
         layout.addWidget(general_panel)
 
         log_panel = QFrame()
@@ -3167,6 +4352,7 @@ class SettingsDialog(QDialog):
 
     def _restore_defaults(self) -> None:
         self.debug_check.setChecked(bool(DEFAULT_PREFERENCES["debug_progress"]))
+        self.update_check.setChecked(bool(DEFAULT_PREFERENCES["check_update_on_startup"]))
         self.logging_check.setChecked(bool(DEFAULT_PREFERENCES["logging_enabled"]))
         self.max_entries_spin.setValue(int(DEFAULT_PREFERENCES["log_max_entries"]))
         self.max_size_spin.setValue(int(DEFAULT_PREFERENCES["log_max_size_mb"]))
@@ -3176,14 +4362,91 @@ class SettingsDialog(QDialog):
         self.accept()
 
 
+class UpdateDialog(QDialog):
+    """Prompt for a newer release found via update.json or the Releases fallback."""
+
+    def __init__(self, host: "CodecFoundryWindow", info: dict) -> None:
+        super().__init__(host)
+        self.setWindowTitle("发现新版本")
+        if not host.windowIcon().isNull():
+            self.setWindowIcon(host.windowIcon())
+        self.setWindowFlag(Qt.WindowType.Tool, True)
+        self.setWindowModality(Qt.WindowModality.ApplicationModal)
+        self.setMinimumWidth(560)
+
+        latest = str(info.get("latest") or "").strip()
+        published = str(info.get("published") or "").strip()
+        pages = [str(item) for item in (info.get("download_pages") or []) if str(item).strip()]
+        notes = update_notes_text(info)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(22, 18, 22, 18)
+        layout.setSpacing(10)
+        title = QLabel("检测到新版本")
+        title.setObjectName("sectionTitle")
+        summary = QLabel(
+            f"最新版本：{latest or '未知'}\n"
+            f"当前版本：{APP_VERSION}\n"
+            f"发布日期：{published or '未知'}"
+        )
+        summary.setStyleSheet("color: #bfbfbf;")
+        layout.addWidget(title)
+        layout.addWidget(summary)
+
+        notes_title = QLabel("更新内容")
+        notes_title.setObjectName("sectionTitle")
+        notes_label = QLabel(notes)
+        notes_label.setWordWrap(True)
+        notes_label.setStyleSheet("color: #d0d0d0;")
+        notes_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(notes_title)
+        layout.addWidget(notes_label, 1)
+
+        actions = QHBoxLayout()
+        later = QPushButton("稍后")
+        later.setObjectName("smallButton")
+        later.clicked.connect(self.reject)
+        actions.addStretch(1)
+        actions.addWidget(later)
+        self._page_buttons: list[tuple[QPushButton, str]] = []
+        if len(pages) >= 2:
+            pairs = [("gitee 下载源", pages[0]), ("github 下载源", pages[1])]
+        elif pages:
+            label = "打开最新 Release 页面" if info.get("from_release") else "打开下载页"
+            pairs = [(label, pages[0])]
+        else:
+            pairs = []
+        for label, page in pairs:
+            button = QPushButton(label)
+            button.setObjectName("primaryButton")
+            button.clicked.connect(
+                lambda _checked=False, url=page: QDesktopServices.openUrl(QUrl(url))
+            )
+            actions.addWidget(button)
+            self._page_buttons.append((button, page))
+        layout.addLayout(actions)
+
+        if not pairs:
+            # No download page at all: fall back to the repository releases page.
+            fallback = QPushButton("打开 Release 页面")
+            fallback.setObjectName("primaryButton")
+            fallback.clicked.connect(
+                lambda _checked=False: QDesktopServices.openUrl(
+                    QUrl("https://github.com/YCTS-otree/CodecFoundry/releases/latest")
+                )
+            )
+            actions.addWidget(fallback)
+
+
 class CodecFoundryWindow(QMainWindow):
-    def __init__(self) -> None:
+    def __init__(self, ipc_server: QLocalServer | None = None) -> None:
         super().__init__()
         self.preferences = self._load_preferences()
         self.debug_progress_enabled = bool(self.preferences["debug_progress"])
         self.logging_enabled = bool(self.preferences["logging_enabled"])
         self.log_max_entries = int(self.preferences["log_max_entries"])
         self.log_max_size_mb = int(self.preferences["log_max_size_mb"])
+        self.check_update_on_startup = bool(self.preferences["check_update_on_startup"])
         try:
             APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
             APP_LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -3212,9 +4475,15 @@ class CodecFoundryWindow(QMainWindow):
         self.bridge.log_message.connect(self._log)
         self.bridge.backend_event.connect(self._handle_backend_event)
         self.bridge.finished.connect(self._finish)
+        self.bridge.update_result.connect(self._on_update_result)
 
+        self.ipc_server = ipc_server
+        if ipc_server is not None:
+            ipc_server.newConnection.connect(self._accept_ipc_connection)
         self.worker: threading.Thread | None = None
         self.controller: ProcessController | None = None
+        self.scheduler: LiveScheduler | None = None
+        self.intake_queue: queue.Queue | None = None
         self.closing = False
         self.close_finalized = False
         self.log_lines: list[str] = []
@@ -3222,17 +4491,23 @@ class CodecFoundryWindow(QMainWindow):
         self.report_path: str | None = None
         self.batch_skipped_count = 0
         self.total_equivalent_frames = 0.0
+        self.session_completed_equivalent = 0.0
+        self.session_completed_count = 0
+        self.session_total_count = 0
         self.active_slot_files: dict[int, str] = {}
         self.slot_widgets: dict[int, dict[str, QWidget]] = {}
         self.slot_states: dict[int, dict[str, object]] = {}
         self.task_widgets: dict[str, dict[str, QWidget]] = {}
         self.task_records: dict[str, dict[str, object]] = {}
+        self.waiting_order: list[str] = []
         self.hlm_path: Path | None = None
         self.last_batch_args: list[str] = []
         self.pending_restarts: dict[str, dict[str, object]] = {}
         self.restart_batch_active = False
         self.restart_batch_keys: set[str] = set()
+        self.restart_keys: set[str] = set()
         self.batch_cancelled_count = 0
+        self._update_check_running = False
 
         self._build_ui()
         self._apply_preferences()
@@ -3410,6 +4685,7 @@ class CodecFoundryWindow(QMainWindow):
             "logging_enabled": self.logging_enabled,
             "log_max_entries": self.log_max_entries,
             "log_max_size_mb": self.log_max_size_mb,
+            "check_update_on_startup": self.check_update_on_startup,
             "window_width": max(900, normal_size.width()),
             "window_height": max(680, normal_size.height()),
             "window_maximized": self.isMaximized(),
@@ -3651,8 +4927,9 @@ class CodecFoundryWindow(QMainWindow):
         layout.addWidget(title)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        self.task_host = QWidget()
+        self.task_host = TaskHostWidget()
         self.task_host.setObjectName("contentHost")
+        self.task_host.reorder_requested.connect(self._handle_card_reorder)
         self.task_layout = QVBoxLayout(self.task_host)
         self.task_layout.setContentsMargins(0, 0, 0, 0)
         self.task_layout.setSpacing(6)
@@ -3867,6 +5144,7 @@ class CodecFoundryWindow(QMainWindow):
     def apply_settings_dialog(self, dialog: SettingsDialog) -> None:
         previous_debug = self.debug_progress_enabled
         self.debug_progress_enabled = dialog.debug_check.isChecked()
+        self.check_update_on_startup = dialog.update_check.isChecked()
         self.logging_enabled = dialog.logging_check.isChecked()
         self.log_max_entries = dialog.max_entries_spin.value()
         self.log_max_size_mb = dialog.max_size_spin.value()
@@ -3985,7 +5263,12 @@ class CodecFoundryWindow(QMainWindow):
         return args
 
     def start(self) -> None:
-        if self.worker and self.worker.is_alive():
+        if self.scheduler is not None and self.scheduler.has_work():
+            QMessageBox.information(
+                self,
+                APP_TITLE,
+                "已有任务正在编码或排队，请等待完成，或先点击“停止全部”。",
+            )
             return
         args = self._validate_and_build_args()
         if args is None:
@@ -3997,27 +5280,24 @@ class CodecFoundryWindow(QMainWindow):
         self.restart_batch_keys.clear()
         self._launch_backend(args, restart=False)
 
-    def _launch_backend(self, args: Sequence[str], *, restart: bool) -> None:
-        self.controller = ProcessController()
+    def _ensure_backend_running(self) -> bool:
+        """Start the persistent scheduler backend when no worker is alive."""
+        if self.worker is not None and self.worker.is_alive():
+            return True
+        controller = ProcessController()
+        scheduler = LiveScheduler(controller)
+        intake_queue: queue.Queue = queue.Queue()
+        self.controller = controller
+        self.scheduler = scheduler
+        self.intake_queue = intake_queue
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
-        self.report_path = None
-        self.batch_skipped_count = 0
-        self.batch_cancelled_count = 0
-        self.total_equivalent_frames = 0.0
-        self.active_slot_files.clear()
-        self.slot_states.clear()
-        self._ensure_slot_cards(4 if self.debug_progress_enabled else 0)
-        self._reset_overall_progress("正在探测视频…")
-        self._set_status("正在探测视频并安排编码任务……")
-        self._log("=" * 72)
-        self._log("重新开始所选任务" if restart else "开始新的批处理")
 
-        def run_backend() -> None:
+        def run_scheduler() -> None:
             set_output_callback(self.bridge.log_message.emit)
             set_event_callback(self.bridge.backend_event.emit)
             try:
-                code = main(list(args), controller=self.controller)
+                code = scheduler.scheduler_loop(intake_queue)
             except SystemExit as exc:
                 code = int(exc.code or 0)
             except BaseException as exc:
@@ -4030,20 +5310,46 @@ class CodecFoundryWindow(QMainWindow):
                 set_event_callback(None)
             self.bridge.finished.emit(code)
 
-        self.worker = threading.Thread(target=run_backend, daemon=True, name="CodecFoundryBackend")
+        self.worker = threading.Thread(
+            target=run_scheduler, daemon=True, name="CodecFoundryScheduler"
+        )
         self.worker.start()
+        return True
 
-    def _launch_pending_restarts(self) -> None:
-        if self.closing or not self.pending_restarts:
+    def _launch_backend(self, args: Sequence[str], *, restart: bool) -> None:
+        created_session = not (
+            self.worker is not None and self.worker.is_alive()
+        )
+        self._ensure_backend_running()
+        if created_session:
+            self._reset_session_counters()
+            if restart:
+                self._reset_overall_progress("正在重新排队所选任务……")
+                self._set_status("正在重新排队所选任务……")
+        if restart:
+            self._log("重新开始所选任务")
+        else:
+            self.report_path = None
+            self.batch_skipped_count = 0
+            self.batch_cancelled_count = 0
+            self.active_slot_files.clear()
+            self.slot_states.clear()
+            self._ensure_slot_cards(4 if self.debug_progress_enabled else 0)
+            self._reset_overall_progress("正在探测视频…")
+            self._set_status("正在探测视频并安排编码任务……")
+            self._log("=" * 72)
+            self._log("开始新的批处理")
+        if self.intake_queue is None:
+            self._log("后台调度器未就绪，任务请求被丢弃")
             return
-        if self.worker and self.worker.is_alive():
-            QTimer.singleShot(50, self._launch_pending_restarts)
-            return
+        self.intake_queue.put(SchedulerRequest(list(args), fresh=not restart))
+
+    def _build_restart_args(
+        self, records: list[tuple[str, dict[str, object]]]
+    ) -> list[str] | None:
         if not self.last_batch_args or "--codec" not in self.last_batch_args:
             self._set_status("无法恢复原批次参数，请重新开始整个批次")
-            return
-        records = list(self.pending_restarts.items())
-        self.pending_restarts.clear()
+            return None
         option_index = self.last_batch_args.index("--codec")
         option_args = list(self.last_batch_args[option_index:])
         if "--overwrite" not in option_args:
@@ -4060,9 +5366,19 @@ class CodecFoundryWindow(QMainWindow):
             input_args = list(dict.fromkeys(
                 str(record.get("source") or "") for _, record in records
             ))
+        return input_args + option_args
+
+    def _launch_pending_restarts(self) -> None:
+        if self.closing or not self.pending_restarts:
+            return
+        records = list(self.pending_restarts.items())
+        self.pending_restarts.clear()
+        args = self._build_restart_args(records)
+        if args is None:
+            return
         self.restart_batch_keys = {key for key, _ in records}
         self.restart_batch_active = True
-        self._launch_backend(input_args + option_args, restart=True)
+        self._launch_backend(args, restart=True)
 
     def stop_all(self) -> None:
         if not self.controller or not self.worker or not self.worker.is_alive():
@@ -4075,10 +5391,23 @@ class CodecFoundryWindow(QMainWindow):
                 int(record.get("slot_id") or 0),
             )
         self.pending_restarts.clear()
+        self.restart_batch_keys.clear()
         self.stop_button.setEnabled(False)
         self._set_status("正在停止全部 FFmpeg 进程，请稍候……")
         self._log("[取消] 用户请求停止全部任务")
-        threading.Thread(target=self.controller.cancel, daemon=True).start()
+        threading.Thread(target=self._cancel_session, daemon=True).start()
+
+    def _cancel_session(self) -> None:
+        if self.controller is not None:
+            self.controller.cancel()
+        if self.scheduler is not None:
+            self.scheduler.request_shutdown()
+
+    def _reset_session_counters(self) -> None:
+        self.total_equivalent_frames = 0.0
+        self.session_completed_equivalent = 0.0
+        self.session_completed_count = 0
+        self.session_total_count = 0
 
     def _log(self, message: str) -> None:
         text = str(message).rstrip()
@@ -4186,32 +5515,60 @@ class CodecFoundryWindow(QMainWindow):
             widgets["frame"].deleteLater()
         self.task_widgets.clear()
         self.task_records.clear()
+        self.waiting_order.clear()
+
+    def _rebuild_task_sidebar(self) -> None:
+        """Lay cards out: waiting tasks first in queue order, then the rest."""
+        if not hasattr(self, "task_layout"):
+            return
+        waiting_keys = [key for key in self.waiting_order if key in self.task_widgets]
+        waiting_set = set(waiting_keys)
+        other_keys = [key for key in self.task_records if key not in waiting_set]
+        while self.task_layout.count():
+            self.task_layout.takeAt(0)
+        for key in reversed(waiting_keys + other_keys):
+            self.task_layout.insertWidget(0, self.task_widgets[key]["frame"])
+        self.task_layout.addStretch(1)
+
+    def _handle_card_reorder(self, dragged_key: str, target_key: object) -> None:
+        keys = list(self.waiting_order)
+        if dragged_key not in keys:
+            return
+        keys.remove(dragged_key)
+        if target_key is not None and target_key in keys:
+            keys.insert(keys.index(target_key), dragged_key)
+        else:
+            keys.append(dragged_key)
+        self.waiting_order = keys
+        if self.scheduler is not None:
+            self.scheduler.reorder_waiting(keys)
+        self._rebuild_task_sidebar()
+        self._set_status("等待队列顺序已更新，将按新顺序调度")
 
     def _populate_task_sidebar(
         self,
-        slots: list[dict[str, object]],
+        ordered_tasks: list[dict[str, object]],
         skipped_tasks: list[dict[str, object]],
     ) -> None:
         self._clear_task_cards()
-        ordered: list[tuple[int, dict[str, object]]] = []
-        max_queue = max((len(slot.get("tasks", [])) for slot in slots), default=0)
-        for queue_index in range(max_queue):
-            for slot in sorted(slots, key=lambda item: int(item.get("slot_id") or 0)):
-                tasks = list(slot.get("tasks", []))
-                if queue_index < len(tasks):
-                    ordered.append((int(slot.get("slot_id") or 0), dict(tasks[queue_index])))
-        for slot_id, task in ordered:
-            self._create_task_card(slot_id, task, "waiting")
+        for task in ordered_tasks:
+            slot_id = int(task.get("slot_id") or 0)
+            task_key = str(task.get("output") or task.get("source") or "")
+            self._create_task_card(slot_id, dict(task), "waiting")
+            self.waiting_order.append(task_key)
         for task in skipped_tasks:
             self._create_task_card(-1, dict(task), "skipped")
+        self._rebuild_task_sidebar()
 
     def _create_task_card(self, slot_id: int, record: dict[str, object], status: str) -> None:
         source = str(record.get("source") or "")
         task_key = str(record.get("output") or source)
         record["slot_id"] = slot_id
         record["status"] = status
-        frame = QFrame()
+        frame = TaskCardFrame()
         frame.setObjectName("panel")
+        frame.set_task_key(task_key)
+        frame.reorder_requested.connect(self._handle_card_reorder)
         layout = QVBoxLayout(frame)
         layout.setContentsMargins(9, 7, 9, 7)
         layout.setSpacing(2)
@@ -4298,6 +5655,7 @@ class CodecFoundryWindow(QMainWindow):
         record = self.task_records.get(task_key)
         if not widgets or record is None:
             return
+        was_waiting = str(record.get("status") or "") == "waiting"
         labels = {
             "waiting": ("等待中", COLOR_WAITING),
             "running": ("进行中", COLOR_RUNNING),
@@ -4351,6 +5709,11 @@ class CodecFoundryWindow(QMainWindow):
             widgets["after"].setText(after_text)
             widgets["after"].setStyleSheet(f"color: {COLOR_DONE if change <= 0 else COLOR_FAILED};")
             widgets["after"].show()
+        if isinstance(widgets["frame"], TaskCardFrame):
+            widgets["frame"].set_draggable(status == "waiting")
+        if was_waiting and status != "waiting" and task_key in self.waiting_order:
+            self.waiting_order.remove(task_key)
+            self._rebuild_task_sidebar()
 
     def _handle_task_action(self, task_key: str) -> None:
         record = self.task_records.get(task_key)
@@ -4361,6 +5724,7 @@ class CodecFoundryWindow(QMainWindow):
         if status == "waiting":
             if task_key in self.pending_restarts:
                 self.pending_restarts.pop(task_key, None)
+                self.restart_keys.discard(task_key)
                 self._update_task_card(task_key, "cancelled", slot_id)
             elif self.controller is not None and self.worker and self.worker.is_alive():
                 self._update_task_card(task_key, "cancelled", slot_id)
@@ -4386,12 +5750,17 @@ class CodecFoundryWindow(QMainWindow):
             ).start()
             return
         if status in {"cancelled", "failed"}:
+            if task_key in self.restart_keys:
+                return
+            self.restart_keys.add(task_key)
             self.pending_restarts[task_key] = dict(record)
             self._update_task_card(task_key, "waiting", slot_id)
+            if task_key not in self.waiting_order:
+                self.waiting_order.append(task_key)
+                self._rebuild_task_sidebar()
             self._set_status(f"已加入重新开始队列：{record.get('filename', task_key)}")
             self._log(f"[重新开始] {record.get('filename', task_key)}")
-            if not self.worker or not self.worker.is_alive():
-                QTimer.singleShot(0, self._launch_pending_restarts)
+            QTimer.singleShot(0, self._launch_pending_restarts)
             return
         if status in {"success", "skipped"}:
             self._open_task_output(record)
@@ -4438,26 +5807,75 @@ class CodecFoundryWindow(QMainWindow):
         if event_type == "batch_done":
             self.batch_cancelled_count = int(payload.get("cancelled") or 0)
             return
+        if event_type == "session_idle":
+            self._handle_session_idle(payload)
+            return
+        if event_type == "ffmpeg_setup":
+            stage = str(payload.get("stage") or "")
+            name = str(payload.get("name") or "")
+            detail = str(payload.get("detail") or "")
+            progress = payload.get("progress")
+            if stage == "download" and progress is not None:
+                self._set_status(f"正在下载 {name} … {float(progress) * 100:.0f}%")
+            else:
+                self._set_status(detail or "正在准备 FFmpeg……")
+            return
+        if event_type == "ffmpeg_failed":
+            page = str(payload.get("page") or "")
+            detail = str(payload.get("detail") or "缺少可用 FFmpeg")
+            install_dir = str(payload.get("install_dir") or "")
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Critical)
+            box.setWindowTitle(APP_TITLE)
+            box.setText(detail)
+            box.setInformativeText(
+                "FFmpeg >= 5.1 才能使用 -fps_mode。\n"
+                f"安装目录：{install_dir}\n"
+                "可打开下载页手动取得 ffmpeg.exe / ffprobe.exe 放入该目录。"
+            )
+            open_button = box.addButton("打开下载页", QMessageBox.ButtonRole.AcceptRole)
+            box.addButton("关闭", QMessageBox.ButtonRole.RejectRole)
+            box.exec()
+            if box.clickedButton() is open_button and page:
+                QDesktopServices.openUrl(QUrl(page))
+            return
+        if event_type == "slots_changed":
+            slots = list(payload.get("slots", []))
+            for slot_plan in slots:
+                slot_id = int(slot_plan.get("slot_id") or 0)
+                self._ensure_slot_cards(max(len(self.slot_widgets), slot_id + 1))
+                widgets = self.slot_widgets.get(slot_id)
+                if widgets:
+                    widgets["title"].setText(
+                        f"E{slot_id} · GPU {slot_plan.get('gpu_index', '?')} / "
+                        f"NVENC {int(slot_plan.get('engine') or 0) + 1}"
+                    )
+            return
         if event_type == "plan":
             slots = list(payload.get("slots", []))
+            self._reset_session_counters()
             self.batch_skipped_count = int(payload.get("skipped_count") or 0)
             self.total_equivalent_frames = float(payload.get("total_equivalent_frames") or 0)
+            self.session_total_count = int(payload.get("task_count") or 0)
             display_slots = int(payload.get("display_slots") or 0)
             self.slot_states.clear()
             self._ensure_slot_cards(display_slots)
-            skipped_tasks = list(payload.get("skipped_tasks", []))
+            ordered_tasks = [dict(raw_task) for raw_task in list(payload.get("ordered_tasks", []))]
+            skipped_tasks = [dict(raw_task) for raw_task in list(payload.get("skipped_tasks", []))]
             if self.restart_batch_active:
-                for slot_plan in slots:
-                    slot_id = int(slot_plan.get("slot_id") or 0)
-                    for raw_task in list(slot_plan.get("tasks", [])):
-                        task = dict(raw_task)
-                        task_key = str(task.get("output") or task.get("source") or "")
-                        if task_key in self.task_records:
-                            self.task_records[task_key].update(task)
-                            self.task_records[task_key]["slot_id"] = slot_id
-                            self._update_task_card(task_key, "waiting", slot_id)
-                        else:
-                            self._create_task_card(slot_id, task, "waiting")
+                # Restarting selected tasks: keep existing cards instead of wiping the sidebar.
+                for raw_task in ordered_tasks:
+                    task = dict(raw_task)
+                    slot_id = int(task.get("slot_id") or 0)
+                    task_key = str(task.get("output") or task.get("source") or "")
+                    if task_key in self.task_records:
+                        self.task_records[task_key].update(task)
+                        self.task_records[task_key]["slot_id"] = slot_id
+                        self._update_task_card(task_key, "waiting", slot_id)
+                    else:
+                        self._create_task_card(slot_id, task, "waiting")
+                    if task_key not in self.waiting_order:
+                        self.waiting_order.append(task_key)
                 for raw_task in skipped_tasks:
                     task = dict(raw_task)
                     task_key = str(task.get("output") or task.get("source") or "")
@@ -4466,8 +5884,11 @@ class CodecFoundryWindow(QMainWindow):
                         self._update_task_card(task_key, "skipped", -1)
                     else:
                         self._create_task_card(-1, task, "skipped")
+                self.restart_batch_active = False
+                self.restart_batch_keys.clear()
+                self._rebuild_task_sidebar()
             else:
-                self._populate_task_sidebar(slots, skipped_tasks)
+                self._populate_task_sidebar(ordered_tasks, skipped_tasks)
             for slot_id, widgets in self.slot_widgets.items():
                 self.slot_states[slot_id] = self._new_slot_state()
                 widgets["title"].setText(f"E{slot_id} · 等待任务")
@@ -4493,11 +5914,45 @@ class CodecFoundryWindow(QMainWindow):
                 f"跳过 {self.batch_skipped_count} 个"
             )
             return
+        if event_type == "tasks_added":
+            added_keys: set[str] = set()
+            for raw_task in list(payload.get("ordered_tasks", [])):
+                task = dict(raw_task)
+                slot_id = int(task.get("slot_id") or 0)
+                task_key = str(task.get("output") or task.get("source") or "")
+                added_keys.add(task_key)
+                if task_key in self.task_records:
+                    self.task_records[task_key].update(task)
+                    self.task_records[task_key]["slot_id"] = slot_id
+                    self._update_task_card(task_key, "waiting", slot_id)
+                else:
+                    self._create_task_card(slot_id, task, "waiting")
+                if task_key not in self.waiting_order:
+                    self.waiting_order.append(task_key)
+            for raw_task in list(payload.get("skipped_tasks", [])):
+                task = dict(raw_task)
+                task_key = str(task.get("output") or task.get("source") or "")
+                if task_key in self.task_records:
+                    self.task_records[task_key].update(task)
+                    self._update_task_card(task_key, "skipped", -1)
+                else:
+                    self._create_task_card(-1, task, "skipped")
+            for task_key in added_keys:
+                self.restart_keys.discard(task_key)
+                self.pending_restarts.pop(task_key, None)
+            if self.restart_batch_keys and (added_keys & self.restart_batch_keys):
+                self.restart_batch_active = False
+                self.restart_batch_keys.clear()
+            self.total_equivalent_frames += float(payload.get("total_equivalent_frames") or 0)
+            self.session_total_count += len(added_keys) + int(payload.get("skipped_count") or 0)
+            self._rebuild_task_sidebar()
+            self._set_status(f"已把 {len(added_keys)} 个任务加入编码队列")
+            return
         if "slot_id" not in payload:
             return
         slot_id = int(payload["slot_id"])
         if slot_id not in self.slot_widgets:
-            self._ensure_slot_cards(slot_id + 1)
+            self._ensure_slot_cards(max(len(self.slot_widgets), slot_id + 1))
         state = self.slot_states.setdefault(slot_id, self._new_slot_state())
         widgets = self.slot_widgets[slot_id]
 
@@ -4514,6 +5969,10 @@ class CodecFoundryWindow(QMainWindow):
                     "cancelled": False,
                     "filename": str(payload.get("filename") or "未知文件"),
                 }
+            )
+            self.session_completed_equivalent = float(
+                payload.get("completed_equivalent_frames")
+                or self.session_completed_equivalent
             )
             self._record_queue_sample(state)
             self.active_slot_files[slot_id] = str(state["filename"])
@@ -4555,11 +6014,11 @@ class CodecFoundryWindow(QMainWindow):
             self.active_slot_files.pop(slot_id, None)
             if status in {"success", "failed"}:
                 state["progress"] = 1.0
-                state["completed_equivalent"] = float(
+                self.session_completed_equivalent = float(
                     payload.get("completed_equivalent_frames")
-                    or float(state.get("completed_equivalent") or 0)
-                    + float(state.get("current_equivalent") or 0)
+                    or self.session_completed_equivalent
                 )
+                self.session_completed_count += 1
                 widgets["current"].setValue(1000)
             label = {"success": "已完成并通过校验", "failed": "失败", "cancelled": "已停止"}.get(status, status)
             widgets["current_text"].setText(f"当前任务：{label}")
@@ -4570,13 +6029,35 @@ class CodecFoundryWindow(QMainWindow):
             self._update_active_status()
             self._update_overall_progress()
 
-    @staticmethod
-    def _queue_processed(state: dict[str, object]) -> float:
-        total = float(state.get("queue_equivalent") or 0)
-        completed = float(state.get("completed_equivalent") or 0)
+    def _handle_session_idle(self, payload: dict[str, object]) -> None:
+        if self.scheduler is not None and self.scheduler.has_work():
+            return
+        self.batch_cancelled_count = int(payload.get("cancelled") or 0)
+        self.stop_button.setEnabled(False)
+        self.start_button.setEnabled(not self.closing)
+        if self.batch_cancelled_count:
+            self._set_status(f"批处理结束 · 已停止 {self.batch_cancelled_count} 个任务")
+        else:
+            if self.total_equivalent_frames > 0:
+                self.overall_progress.setValue(1000)
+                self.overall_detail.setText("总进度 100.0% · 全部输出均已通过 GPU 校验")
+            else:
+                self._reset_overall_progress("无需编码 · 已有输出均验证有效")
+            suffix = f" · 报告：{self.report_path}" if self.report_path else ""
+            self._set_status(f"全部任务已完成并验证{suffix}")
+
+    def _queue_processed(self, state: dict[str, object]) -> float:
+        """Session-wide processed equivalent frames including this slot's current file."""
         current = float(state.get("current_equivalent") or 0)
         progress = float(state.get("progress") or 0)
-        return min(total, completed + current * progress) if total else 0.0
+        return self.session_completed_equivalent + current * progress
+
+    def _combined_rate(self) -> float:
+        rate = 0.0
+        for state in self.slot_states.values():
+            if state.get("active") and not state.get("cancelled"):
+                rate += float(state.get("equivalent_fps") or 0)
+        return rate
 
     def _record_queue_sample(self, state: dict[str, object], fallback_rate: float = 0.0) -> None:
         samples = state.get("rate_samples")
@@ -4594,37 +6075,45 @@ class CodecFoundryWindow(QMainWindow):
     def _update_slot_queue(self, slot_id: int) -> None:
         state = self.slot_states[slot_id]
         widgets = self.slot_widgets[slot_id]
-        total = float(state.get("queue_equivalent") or 0)
+        total = self.total_equivalent_frames
         processed = self._queue_processed(state)
-        percentage = processed / total if total else 0.0
-        rate = float(state.get("equivalent_fps") or 0)
+        percentage = min(1.0, processed / total) if total else 0.0
+        rate = self._combined_rate()
         remaining = max(0.0, total - processed)
-        eta = self._format_duration(remaining / rate) if remaining > 0 and rate > 0 else ("00:00:00" if remaining <= 0 else "--")
+        eta = (
+            self._format_duration(remaining / rate)
+            if remaining > 0 and rate > 0
+            else ("00:00:00" if remaining <= 0 else "--")
+        )
         widgets["queue"].setValue(round(percentage * 1000))
-        task_index = int(state.get("task_index", -1))
-        task_number = min(int(state.get("queue_total") or 0), task_index + 1)
         widgets["queue_text"].setText(
-            f"队列 {max(0, task_number)}/{int(state.get('queue_total') or 0)} · "
+            f"队列 {self.session_completed_count}/{self.session_total_count} · "
             f"{percentage * 100:.1f}% · ETA {eta}"
         )
 
     def _update_overall_progress(self) -> None:
-        processed = 0.0
-        combined_rate = 0.0
-        queue_metrics: list[tuple[float, float]] = []
+        total = self.total_equivalent_frames
+        running_work = 0.0
         for state in self.slot_states.values():
-            queue_processed = self._queue_processed(state)
-            processed += queue_processed
-            remaining = max(0.0, float(state.get("queue_equivalent") or 0) - queue_processed)
-            rate = float(state.get("equivalent_fps") or 0)
-            if remaining > 0:
-                if rate > 0 and not state.get("cancelled"):
-                    combined_rate += rate
-                queue_metrics.append((remaining, rate if not state.get("cancelled") else 0.0))
-        percentage = min(1.0, processed / self.total_equivalent_frames) if self.total_equivalent_frames else 0.0
-        eta_value = parallel_queue_eta(queue_metrics)
+            if state.get("active"):
+                running_work += float(state.get("current_equivalent") or 0) * float(
+                    state.get("progress") or 0
+                )
+        processed = (
+            min(total, self.session_completed_equivalent + running_work)
+            if total
+            else 0.0
+        )
+        percentage = processed / total if total else 0.0
+        combined_rate = self._combined_rate()
+        remaining = max(0.0, total - processed)
+        eta_value = (
+            remaining / combined_rate
+            if remaining > 0 and combined_rate > 0
+            else (0.0 if remaining <= 0 else None)
+        )
         eta = self._format_duration(eta_value) if eta_value is not None else "--"
-        self.overall_progress.setValue(round(percentage * 1000))
+        self.overall_progress.setValue(round(min(1.0, percentage) * 1000))
         self.overall_detail.setText(
             f"总进度 {percentage * 100:.1f}% · 10秒等效 {combined_rate:.1f} fps · ETA {eta}"
         )
@@ -4736,7 +6225,11 @@ class CodecFoundryWindow(QMainWindow):
             "  2. 支持 NVIDIA HEVC / AV1 与多编码核心调度\n"
             "  3. 已有输出和新编码输出均执行 GPU / NVDEC 全量校验\n"
             "  4. 提供 CQ-VBR、实时进度、任务队列和安全退出保护\n"
-            "  5. 支持直接拖入视频文件或文件夹"
+            "  5. 支持直接拖入视频文件或文件夹\n"
+            "  6. 单实例运行：FlashCut 重复联动会合并进现有编码队列\n"
+            "  7. 等待任务支持长按拖拽排序，直接影响后续调度\n"
+            "  8. 内置 FFmpeg 版本检测与自动安装（应用目录，不动系统 PATH）\n"
+            "  9. 启动自动检查更新（update.json / GitHub Releases）"
         )
         changes.setWordWrap(True)
         changes.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
@@ -4780,6 +6273,157 @@ class CodecFoundryWindow(QMainWindow):
         footer.addWidget(close_button)
         layout.addLayout(footer)
         dialog.exec()
+
+    # -- update checking ---------------------------------------------------
+
+    def check_for_updates_manual(self) -> None:
+        self._run_update_check("manual")
+
+    def start_auto_update_check(self) -> None:
+        if not self.check_update_on_startup:
+            return
+        QTimer.singleShot(3000, lambda: self._run_update_check("auto"))
+
+    def _run_update_check(self, mode: str) -> None:
+        if self._update_check_running:
+            return
+        self._update_check_running = True
+        if mode == "manual":
+            self._set_status("正在检查更新……")
+
+        def worker() -> None:
+            try:
+                info = check_for_updates()
+                reachable = update_sources_reachable()
+            except Exception as exc:
+                self._log(f"[更新] 检查更新异常：{exc}")
+                info = None
+                reachable = False
+            self.bridge.update_result.emit(mode, {"info": info, "reachable": reachable})
+
+        threading.Thread(target=worker, daemon=True, name="CodecFoundryUpdater").start()
+
+    def _on_update_result(self, mode: str, payload: object) -> None:
+        self._update_check_running = False
+        data = dict(payload) if isinstance(payload, dict) else {}
+        info = data.get("info")
+        reachable = bool(data.get("reachable", True))
+        if isinstance(info, dict):
+            dialog = UpdateDialog(self, info)
+            dialog.exec()
+        elif mode == "manual":
+            if reachable:
+                QMessageBox.information(self, APP_TITLE, "当前已是最新版本。")
+            else:
+                QMessageBox.warning(
+                    self,
+                    APP_TITLE,
+                    "无法连接更新服务器，请检查网络后重试。",
+                )
+        elif reachable:
+            self._set_status(f"已是最新版本 {APP_VERSION}")
+
+    # -- single-instance IPC ----------------------------------------------
+
+    def retry_ipc_claim(self) -> None:
+        """Second chance to claim the instance slot once the event loop runs."""
+        if self.ipc_server is not None:
+            return
+        server, forwarded = acquire_single_instance(
+            getattr(self, "startup_argv", [])
+        )
+        if forwarded:
+            # Another instance took over this launch request; do not keep a
+            # second full instance running without IPC.
+            self._log("[单实例] 已有实例接管本次启动请求，本窗口自动退出")
+            self._begin_safe_exit(running=bool(self.worker and self.worker.is_alive()))
+            return
+        if server is None:
+            return
+        self.ipc_server = server
+        server.newConnection.connect(self._accept_ipc_connection)
+        self._log("[单实例] 已取得单实例服务")
+
+    def _accept_ipc_connection(self) -> None:
+        server = self.ipc_server
+        if server is None:
+            return
+        sockets = getattr(self, "_ipc_sockets", None)
+        if sockets is None:
+            sockets = set()
+            self._ipc_sockets = sockets
+        while server.hasPendingConnections():
+            socket = server.nextPendingConnection()
+            if socket is None:
+                continue
+            # Keep a reference: the socket dies when Python garbage-collects it.
+            sockets.add(socket)
+            socket.disconnected.connect(lambda client=socket: sockets.discard(client))
+            socket.readyRead.connect(
+                lambda client=socket: self._read_ipc_payload(client)
+            )
+
+    def _read_ipc_payload(self, socket) -> None:
+        try:
+            raw = bytes(socket.readAll())
+        except (OSError, RuntimeError):
+            return
+        if not raw.strip():
+            return
+        try:
+            data = json.loads(raw.decode("utf-8", errors="replace"))
+            if not isinstance(data, dict):
+                raise ValueError("payload is not a JSON object")
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            # Tell the caller the request was NOT accepted so it can fall back
+            # to running locally instead of silently losing the job.
+            try:
+                socket.write(b"err")
+                socket.flush()
+            except (OSError, RuntimeError):
+                pass
+            finally:
+                socket.disconnectFromServer()
+            return
+        try:
+            socket.write(b"ok")
+            socket.flush()
+        except (OSError, RuntimeError):
+            pass
+        finally:
+            socket.disconnectFromServer()
+        argv = [str(item) for item in data.get("argv", []) if str(item) != "--cli"]
+        if not argv:
+            self._activate_from_external()
+            return
+        self._handle_external_request(argv)
+
+    def _activate_from_external(self) -> None:
+        self._log("[单实例] 收到新启动请求，已激活现有窗口")
+        if self.isMinimized():
+            self.showNormal()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def _handle_external_request(self, argv: list[str]) -> None:
+        if self.closing:
+            self._log("[单实例] 窗口正在退出，忽略外部任务请求")
+            return
+        if any(flag in argv for flag in ("--version", "--help", "-h", "--doctor", "--dry-run")):
+            return
+        has_job = "--hlm" in argv or any(not str(item).startswith("-") for item in argv)
+        if not has_job:
+            self._activate_from_external()
+            return
+        self._log(f"[单实例] 收到外部任务请求：{subprocess.list2cmdline(argv)}")
+        if self.intake_queue is None or self.worker is None or not self.worker.is_alive():
+            self._ensure_backend_running()
+        if self.intake_queue is None:
+            self._log("[单实例] 后台调度器未就绪，任务请求被丢弃")
+            return
+        self.intake_queue.put(SchedulerRequest(argv, fresh=False))
+        self._set_status("已接收外部任务，正在加入编码队列……")
 
     def _save_session_log(self) -> Path | None:
         self._save_preferences()
@@ -4866,6 +6510,13 @@ class CodecFoundryWindow(QMainWindow):
             return
         set_output_callback(None)
         set_event_callback(None)
+        if self.ipc_server is not None:
+            try:
+                self.ipc_server.close()
+                self.ipc_server.deleteLater()
+            except RuntimeError:
+                pass
+            self.ipc_server = None
         self.log_saved_path = self._save_session_log()
         self.app_logger.close()
         self.close_finalized = True
@@ -4910,18 +6561,33 @@ def gui_main(argv: Sequence[str] | None = None) -> int:
     palette.setColor(QPalette.ColorRole.Highlight, QColor(COLOR_BLUE))
     app.setPalette(palette)
     app.setStyleSheet(APP_STYLESHEET)
-    window = CodecFoundryWindow()
+    ipc_server, forwarded = acquire_single_instance(gui_arguments)
+    if forwarded:
+        # The request was handed to the running instance; do not open a second window.
+        return 0
+    window = CodecFoundryWindow(ipc_server=ipc_server)
+    window.startup_argv = list(gui_arguments)
     window.show()
+    if ipc_server is None:
+        # Lost the claim race: retry once the event loop is running.
+        QTimer.singleShot(600, window.retry_ipc_claim)
     if gui_options.hlm:
         try:
             window.import_hlm(gui_options.hlm)
         except TranscodeError as exc:
             QMessageBox.critical(window, APP_TITLE, f"无法载入 FlashCut HLM：\n{exc}")
+    window.start_auto_update_check()
     return app.exec()
 
 
 if __name__ == "__main__":
     if "--cli" in sys.argv or "--version" in sys.argv:
         cli_args = [argument for argument in sys.argv[1:] if argument != "--cli"]
+        if "--version" in cli_args:
+            raise SystemExit(main(cli_args))
+        if _cli_request_can_forward(cli_args):
+            app = QApplication.instance() or QApplication(["CodecFoundry-forward"])
+            if _forward_to_running_instance(cli_args):
+                raise SystemExit(0)
         raise SystemExit(main(cli_args))
     raise SystemExit(gui_main(sys.argv[1:]))
