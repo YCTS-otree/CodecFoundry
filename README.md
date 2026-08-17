@@ -1,6 +1,6 @@
-# CodecFoundry v1.3.1-beta · NVIDIA HEVC / AV1 批量视频压制
+# CodecFoundry v1.3.2-beta · NVIDIA HEVC / AV1 批量视频压制
 
-当前源码入口为 `CodecFoundry.pyw`，应用内部版本为 1.3.1-beta：PySide6 界面与 FFmpeg/NVENC 调度后端均
+当前源码入口为 `CodecFoundry.pyw`，应用内部版本为 1.3.2-beta：PySide6 界面与 FFmpeg/NVENC 调度后端均
 内置在同一个源码文件中。程序读取 `gpus.json`，按每块卡的编码、解码能力和
 `encoder_engines` 数量调度多个视频。
 

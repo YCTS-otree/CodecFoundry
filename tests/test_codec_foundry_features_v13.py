@@ -731,15 +731,68 @@ class FramelessResizeTests(unittest.TestCase):
                 )
                 return int(result) if handled else 0
 
-            border = 3
-            self.assertEqual(nchit(rect.left() + border, rect.center().y()), 10)  # HTLEFT
-            self.assertEqual(nchit(rect.right() - border, rect.center().y()), 11)  # HTRIGHT
-            self.assertEqual(nchit(rect.center().x(), rect.top() + border), 12)  # HTTOP
-            self.assertEqual(nchit(rect.center().x(), rect.bottom() - border), 15)  # HTBOTTOM
-            self.assertEqual(nchit(rect.left() + border, rect.top() + border), 13)  # HTTOPLEFT
-            self.assertEqual(nchit(rect.right() - border, rect.bottom() - border), 17)  # HTBOTTOMRIGHT
-            # Inside the window: default handling (0 = not handled here)
+            left, top = rect.left(), rect.top()
+            right_edge = rect.right() - 1  # inside the 3px physical border
+            bottom_edge = rect.bottom() - 1
+            self.assertEqual(nchit(left + 1, rect.center().y()), 10)  # HTLEFT
+            self.assertEqual(nchit(right_edge, rect.center().y()), 11)  # HTRIGHT
+            self.assertEqual(nchit(rect.center().x(), top + 1), 12)  # HTTOP
+            self.assertEqual(nchit(rect.center().x(), bottom_edge), 15)  # HTBOTTOM
+            self.assertEqual(nchit(left + 1, top + 1), 13)  # HTTOPLEFT
+            self.assertEqual(nchit(right_edge, bottom_edge), 17)  # HTBOTTOMRIGHT
+            # Inside the window (center) or beyond the 3px border: default handling
             self.assertEqual(nchit(rect.center().x(), rect.center().y()), 0)
+            self.assertEqual(nchit(rect.right() - 8, rect.center().y()), 0)
+            self.assertEqual(nchit(rect.left() + 8, rect.center().y()), 0)
+            self.assertEqual(nchit(rect.center().x(), rect.top() + 8), 0)
+            self.assertEqual(nchit(rect.center().x(), rect.bottom() - 8), 0)
+        finally:
+            window.app_logger.close()
+            window.close_finalized = True
+            window.close()
+
+    def test_native_hit_test_scales_geometry_by_device_pixel_ratio(self):
+        if os.name != "nt":
+            self.skipTest("WM_NCHITTEST resize is Windows-only")
+        window = cf.CodecFoundryWindow()
+        try:
+            window.resize(1000, 800)
+            window.show()
+            self.app.processEvents()
+            rect = window.frameGeometry()
+
+            class FakeScreen:
+                def devicePixelRatio(self):
+                    return 2.0
+
+            def nchit(x: int, y: int) -> int:
+                from shiboken6 import VoidPtr
+                message = cf.ctypes.wintypes.MSG()
+                message.message = 0x0084
+                message.lParam = (y << 16) | (x & 0xFFFF)
+                handled, result = window.nativeEvent(
+                    b"windows_generic_MSG", VoidPtr(cf.ctypes.addressof(message))
+                )
+                return int(result) if handled else 0
+
+            # lParam is physical pixels: logical rect * 2.
+            left = rect.left() * 2
+            top = rect.top() * 2
+            right = (rect.right() + 1) * 2
+            bottom = (rect.bottom() + 1) * 2
+            center_x = (left + right) // 2
+            center_y = (top + bottom) // 2
+            with mock.patch.object(window, "screen", return_value=FakeScreen()):
+                self.assertEqual(nchit(left + 1, center_y), 10)  # HTLEFT
+                self.assertEqual(nchit(right - 1, center_y), 11)  # HTRIGHT
+                self.assertEqual(nchit(center_x, top + 1), 12)  # HTTOP
+                self.assertEqual(nchit(center_x, bottom - 1), 15)  # HTBOTTOM
+                self.assertEqual(nchit(left + 1, top + 1), 13)  # HTTOPLEFT
+                self.assertEqual(nchit(right - 1, bottom - 1), 17)  # HTBOTTOMRIGHT
+                # Physical points well inside the window must NOT resize.
+                self.assertEqual(nchit(center_x, center_y), 0)
+                self.assertEqual(nchit(right - 12, center_y), 0)
+                self.assertEqual(nchit(center_x, bottom - 12), 0)
         finally:
             window.app_logger.close()
             window.close_finalized = True

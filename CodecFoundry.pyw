@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CodecFoundry v1.3.1-beta: single-file PySide6 NVENC transcoder.
+"""CodecFoundry v1.3.2-beta: single-file PySide6 NVENC transcoder.
 
 The backend and desktop UI intentionally live in this one source file.  The GPU
 capability database remains external data: driver/runtime discovery tells us which
@@ -119,7 +119,7 @@ VIDEO_EXTENSIONS = {
     ".3gp", ".avi", ".flv", ".m2ts", ".m4v", ".mkv", ".mov", ".mp4",
     ".mpeg", ".mpg", ".mts", ".ts", ".webm", ".wmv",
 }
-CODECFOUNDRY_VERSION = "1.3.1-beta"
+CODECFOUNDRY_VERSION = "1.3.2-beta"
 HLM_FORMAT = "FlashCut Highlight Markers"
 SUPPORTED_HLM_VERSION = 2
 CODEC_ALIASES = {
@@ -5920,7 +5920,13 @@ class CodecFoundryWindow(QMainWindow):
             self.title_bar.maximize_button.setToolTip("最大化")
 
     def nativeEvent(self, event_type, message):
-        """Frameless window: re-enable native border resize via WM_NCHITTEST."""
+        """Frameless window: re-enable native border resize via WM_NCHITTEST.
+
+        WM_NCHITTEST coordinates are physical screen pixels while Qt geometry
+        is logical, so the frame rectangle is scaled by the window screen's
+        device pixel ratio before comparing; only a 3-physical-pixel border on
+        each of the four edges (and corners) triggers a resize.
+        """
         if os.name == "nt" and event_type == b"windows_generic_MSG":
             try:
                 native_message = ctypes.wintypes.MSG.from_address(int(message))
@@ -5929,14 +5935,24 @@ class CodecFoundryWindow(QMainWindow):
             if native_message.message == 0x0084:  # WM_NCHITTEST
                 if self.isMaximized() or self.isFullScreen():
                     return super().nativeEvent(event_type, message)
+                rect = self.frameGeometry()
+                if rect.width() <= 0 or rect.height() <= 0:
+                    return super().nativeEvent(event_type, message)
+                screen = self.screen() or QApplication.primaryScreen()
+                device_ratio = screen.devicePixelRatio() if screen is not None else 1.0
+                left = round(rect.left() * device_ratio)
+                top = round(rect.top() * device_ratio)
+                right = round((rect.right() + 1) * device_ratio)
+                bottom = round((rect.bottom() + 1) * device_ratio)
                 x = ctypes.c_short(native_message.lParam & 0xFFFF).value
                 y = ctypes.c_short((native_message.lParam >> 16) & 0xFFFF).value
-                rect = self.frameGeometry()
-                border = 6
-                on_left = x < rect.left() + border
-                on_right = x > rect.right() - border
-                on_top = y < rect.top() + border
-                on_bottom = y > rect.bottom() - border
+                border = 3  # 仅边缘 2-3 个物理像素
+                if not (left <= x < right and top <= y < bottom):
+                    return super().nativeEvent(event_type, message)
+                on_left = x < left + border
+                on_right = x >= right - border
+                on_top = y < top + border
+                on_bottom = y >= bottom - border
                 hit = None
                 if on_top and on_left:
                     hit = 13  # HTTOPLEFT
