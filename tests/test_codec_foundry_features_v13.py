@@ -484,6 +484,74 @@ class SchedulerReorderTests(unittest.TestCase):
             self.assertTrue(report.is_file())
             self.assertIn("多种", report.read_text(encoding="utf-8-sig"))
 
+    def test_plan_event_order_matches_intake_top_to_bottom(self):
+        events = []
+        cf.set_event_callback(lambda kind, payload: events.append((kind, dict(payload))))
+        scheduler = cf.LiveScheduler(cf.ProcessController())
+        gpu = cf.GpuCapability(0, "GPU", 2, frozenset({"hevc"}), frozenset({"h264", "hevc"}))
+        tasks = [make_task(name) for name in ("a.mp4", "b.mp4", "c.mp4")]
+        plan = cf.JobPlan(
+            tasks=tasks,
+            skipped_tasks=[],
+            all_tasks=list(tasks),
+            settings=make_settings(),
+            usable_gpus=[gpu],
+            output_dir=None,
+            codec="hevc",
+            container="mp4",
+        )
+        args = cf.argparse.Namespace(
+            ffmpeg="ffmpeg", ffprobe="ffprobe",
+            no_cpu_affinity=False, no_software_fallback=False,
+            debug_progress=False,
+        )
+        try:
+            scheduler._append_request_locked(plan, args, fresh=True)
+        finally:
+            cf.set_event_callback(None)
+        plan_events = [payload for kind, payload in events if kind == "plan"]
+        self.assertTrue(plan_events)
+        ordered = [str(item["output"]) for item in plan_events[0]["ordered_tasks"]]
+        self.assertEqual(ordered, [str(t.output) for t in tasks])
+
+    def test_kill_all_app_processes_taskkills_every_tracked_pid(self):
+        with mock.patch.object(cf.subprocess, "run") as run:
+            cf._app_processes.clear()
+            cf._app_processes.update({111, 222})
+            cf.kill_all_app_processes()
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(cf._app_processes, set())
+
+    def test_status_change_relayouts_without_animation(self):
+        window = cf.CodecFoundryWindow()
+        try:
+            source = str(Path("D:/video/source.mp4"))
+            first = {
+                "source": source,
+                "output": str(Path("D:/out/a.mp4")),
+                "filename": "a.mp4",
+            }
+            second = {
+                "source": source,
+                "output": str(Path("D:/out/b.mp4")),
+                "filename": "b.mp4",
+            }
+            window._create_task_card(0, first, "waiting")
+            window._create_task_card(0, second, "waiting")
+            window.waiting_order = [first["output"], second["output"]]
+            window._reflow_animations.clear()
+            window._update_task_card(
+                first["output"], "success", 0,
+                {"input_size": 1000, "output_size": 500},
+            )
+            # Immediate relayout: no glide animations are started.
+            self.assertEqual(window._reflow_animations, {})
+            self.assertEqual(
+                list(window.waiting_order), [second["output"]]
+            )
+        finally:
+            _close_window(window)
+
 
 class CliForwardTests(unittest.TestCase):
     def test_only_real_jobs_are_forwarded(self):

@@ -136,6 +136,36 @@ OUTPUT_CALLBACK = None
 EVENT_CALLBACK = None
 REFERENCE_PIXELS = 1920 * 1080
 
+# Every FFmpeg/ffprobe PID this process ever spawned.  Used as a last-resort
+# sweep so "停止全部" can never leave a stray encoder running, even if it was
+# started outside the ProcessController's registration window.
+_app_processes: set[int] = set()
+_app_processes_lock = threading.Lock()
+
+
+def _track_process(pid: int) -> None:
+    with _app_processes_lock:
+        _app_processes.add(pid)
+
+
+def kill_all_app_processes() -> None:
+    """taskkill every tracked PID; already-dead PIDs are harmless no-ops."""
+    with _app_processes_lock:
+        pids = list(_app_processes)
+        _app_processes.clear()
+    for pid in pids:
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=5,
+                creationflags=windows_creation_flags(),
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
 
 class TranscodeError(RuntimeError):
     """An expected configuration, probing, or transcoding error."""
@@ -941,6 +971,7 @@ def run_validation_decode(
             errors="replace",
             **popen_options,
         )
+        _track_process(process.pid)
         if controller is not None:
             if task_key is None:
                 controller.register(process)
@@ -1609,6 +1640,7 @@ def run_ffmpeg(
                 errors="replace",
                 **popen_options,
             )
+            _track_process(process.pid)
             if task_key is None:
                 controller.register(process)
             else:
@@ -6546,13 +6578,15 @@ class CodecFoundryWindow(QMainWindow):
         threading.Thread(target=self._cancel_session, daemon=True).start()
 
     def _cancel_session(self) -> None:
-        # Stop dispatching new work first, then cancel every FFmpeg process
-        # and sweep again so nothing keeps encoding after "停止全部".
+        # Stop dispatching new work first, then cancel every FFmpeg process,
+        # sweep the controller again, and finally taskkill every PID this app
+        # ever spawned so nothing keeps encoding after "停止全部".
         if self.scheduler is not None:
             self.scheduler.request_shutdown()
         if self.controller is not None:
             self.controller.cancel()
             self.controller.force_stop_all()
+        kill_all_app_processes()
 
     def _reset_session_counters(self) -> None:
         self.total_equivalent_frames = 0.0
@@ -6669,18 +6703,24 @@ class CodecFoundryWindow(QMainWindow):
         self.waiting_order.clear()
 
     def _rebuild_task_sidebar(
-        self, exclude_key: str | None = None, insert_key: str | None = None
+        self,
+        exclude_key: str | None = None,
+        insert_key: str | None = None,
+        animate: bool | None = None,
     ) -> None:
         """Lay cards out: waiting tasks first in queue order, then the rest.
 
         During a drag, ``exclude_key`` removes the dragged card from the layout
         and ``insert_key`` draws a highlighted line where it will be inserted;
-        the other cards glide to their new positions when the drag animation
-        setting is enabled.
+        the other cards glide to their new positions when ``animate`` is True
+        (drag avoidance).  Status changes pass ``animate=False`` so a card that
+        grows (e.g. the "完成" summary appears) reflows the next card
+        immediately instead of overlapping it.
         """
         if not hasattr(self, "task_layout"):
             return
-        animate = bool(getattr(self, "drag_animation_enabled", True))
+        if animate is None:
+            animate = bool(getattr(self, "drag_animation_enabled", True))
         old_positions: dict[str, QPoint] = {}
         if animate:
             for key, widgets in self.task_widgets.items():
@@ -6854,7 +6894,7 @@ class CodecFoundryWindow(QMainWindow):
             self._update_task_card(key, "waiting", int(record.get("slot_id") or 0))
             if key not in self.waiting_order:
                 self.waiting_order.append(key)
-        self._rebuild_task_sidebar()
+        self._rebuild_task_sidebar(animate=False)
         self._log(f"[重新开始] 一键重试 {len(retryable)} 个任务")
         QTimer.singleShot(0, self._launch_pending_restarts)
 
@@ -6871,7 +6911,7 @@ class CodecFoundryWindow(QMainWindow):
             self.waiting_order.append(task_key)
         for task in skipped_tasks:
             self._create_task_card(-1, dict(task), "skipped")
-        self._rebuild_task_sidebar()
+        self._rebuild_task_sidebar(animate=False)
 
     def _create_task_card(self, slot_id: int, record: dict[str, object], status: str) -> None:
         source = str(record.get("source") or "")
@@ -6970,7 +7010,8 @@ class CodecFoundryWindow(QMainWindow):
         record = self.task_records.get(task_key)
         if not widgets or record is None:
             return
-        was_waiting = str(record.get("status") or "") == "waiting"
+        previous_status = str(record.get("status") or "")
+        was_waiting = previous_status == "waiting"
         labels = {
             "waiting": ("等待中", COLOR_WAITING),
             "running": ("进行中", COLOR_RUNNING),
@@ -7028,7 +7069,11 @@ class CodecFoundryWindow(QMainWindow):
             widgets["frame"].set_draggable(status == "waiting")
         if was_waiting and status != "waiting" and task_key in self.waiting_order:
             self.waiting_order.remove(task_key)
-            self._rebuild_task_sidebar(exclude_key=self._active_drag_key)
+            self._rebuild_task_sidebar(exclude_key=self._active_drag_key, animate=False)
+        elif previous_status != status:
+            # A card's height changes with its status (e.g. the "完成" summary
+            # appears): recompute the layout immediately so cards never overlap.
+            self._rebuild_task_sidebar(exclude_key=self._active_drag_key, animate=False)
         self._update_retry_all_button()
 
     def _handle_task_action(self, task_key: str) -> None:
@@ -7073,7 +7118,7 @@ class CodecFoundryWindow(QMainWindow):
             self._update_task_card(task_key, "waiting", slot_id)
             if task_key not in self.waiting_order:
                 self.waiting_order.append(task_key)
-                self._rebuild_task_sidebar()
+                self._rebuild_task_sidebar(animate=False)
             self._set_status(f"已加入重新开始队列：{record.get('filename', task_key)}")
             self._log(f"[重新开始] {record.get('filename', task_key)}")
             QTimer.singleShot(0, self._launch_pending_restarts)
@@ -7211,7 +7256,7 @@ class CodecFoundryWindow(QMainWindow):
                         self._create_task_card(-1, task, "skipped")
                 self.restart_batch_active = False
                 self.restart_batch_keys.clear()
-                self._rebuild_task_sidebar()
+                self._rebuild_task_sidebar(animate=False)
             else:
                 self._populate_task_sidebar(ordered_tasks, skipped_tasks)
             for slot_id, widgets in self.slot_widgets.items():
@@ -7270,7 +7315,7 @@ class CodecFoundryWindow(QMainWindow):
                 self.restart_batch_keys.clear()
             self.total_equivalent_frames += float(payload.get("total_equivalent_frames") or 0)
             self.session_total_count += len(added_keys) + int(payload.get("skipped_count") or 0)
-            self._rebuild_task_sidebar()
+            self._rebuild_task_sidebar(animate=False)
             self._set_status(f"已把 {len(added_keys)} 个任务加入编码队列")
             return
         if "slot_id" not in payload:
