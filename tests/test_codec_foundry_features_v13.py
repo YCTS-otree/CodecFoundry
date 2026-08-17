@@ -701,6 +701,9 @@ class GuiReorderTests(unittest.TestCase):
                 window._create_task_card(0, record, "waiting")
                 keys.append(record["output"])
             window.waiting_order = list(keys)
+            # The sidebar layout is disabled (positions are managed manually),
+            # so stack the cards once before measuring their centers.
+            window._rebuild_task_sidebar(animate=False)
             cf.QApplication.instance().processEvents()
             window.begin_card_drag(keys[0])
             first_center = window.task_widgets[keys[1]]["frame"].mapToGlobal(
@@ -714,6 +717,40 @@ class GuiReorderTests(unittest.TestCase):
             self.assertEqual(window.waiting_order, [keys[1], keys[0], keys[2]])
             window.on_card_drag_finished(keys[0])
             self.assertEqual(window.waiting_order, [keys[1], keys[0], keys[2]])
+        finally:
+            _close_window(window)
+
+    def test_second_rebuild_cancels_stale_drag_glide(self):
+        # A drag glide toward old targets must never outlive the next rebuild:
+        # cards used to keep sliding to the drag layout and embed the next card.
+        window = cf.CodecFoundryWindow()
+        try:
+            window.resize(1500, 900)
+            window.show()
+            cf.QApplication.instance().processEvents()
+            source = str(Path("D:/video/source.mp4"))
+            keys = []
+            for index in range(3):
+                record = {
+                    "source": source,
+                    "output": str(Path(f"D:/out/{index}.mp4")),
+                    "filename": f"f{index}.mp4",
+                }
+                window._create_task_card(0, record, "waiting")
+                keys.append(record["output"])
+            window.waiting_order = list(keys)
+            window._rebuild_task_sidebar(animate=False)
+            cf.QApplication.instance().processEvents()
+            # drag layout: card 0 out, cards 1/2 glide up toward the indicator
+            window._rebuild_task_sidebar(
+                exclude_key=keys[0], insert_key=keys[0], animate=True
+            )
+            # final rebuild must win over that in-flight glide
+            window._rebuild_task_sidebar(animate=True)
+            self.assertEqual(window._reflow_animations, {})
+            frames = [window.task_widgets[k]["frame"] for k in keys]
+            self.assertGreaterEqual(frames[1].y(), frames[0].y() + frames[0].height())
+            self.assertGreaterEqual(frames[2].y(), frames[1].y() + frames[1].height())
         finally:
             _close_window(window)
 

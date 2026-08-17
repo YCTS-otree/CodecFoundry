@@ -163,6 +163,7 @@ def kill_all_app_processes() -> None:
                 timeout=5,
                 creationflags=windows_creation_flags(),
             )
+            say(f"[进程] 已终止残留进程 PID {pid}")
         except (OSError, subprocess.TimeoutExpired):
             pass
 
@@ -172,16 +173,23 @@ class TranscodeError(RuntimeError):
 
 
 def run_captured_text(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
-    """Run a tool whose redirected output is UTF-8, regardless of Windows locale."""
-    return subprocess.run(
-        command,
-        capture_output=True,
+    """Run a tool whose redirected output is UTF-8, regardless of Windows locale.
+
+    Spawns via Popen so the child PID joins the app-wide process tracker: a
+    stop-all can kill even an in-flight ffprobe during planning.
+    """
+    process = subprocess.Popen(
+        list(command),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
         encoding="utf-8",
         errors="replace",
-        check=False,
         creationflags=windows_creation_flags(),
     )
+    _track_process(process.pid)
+    stdout, stderr = process.communicate()
+    return subprocess.CompletedProcess(list(command), process.returncode, stdout, stderr)
 
 
 @dataclass(frozen=True)
@@ -380,6 +388,7 @@ class ProcessController:
     def _force_stop(process: subprocess.Popen[str]) -> None:
         if process.poll() is not None:
             return
+        say(f"[进程] 强制终止 PID {process.pid}")
         try:
             if os.name == "nt":
                 subprocess.run(
@@ -972,6 +981,7 @@ def run_validation_decode(
             **popen_options,
         )
         _track_process(process.pid)
+        say(f"[进程] 启动校验解码 PID {process.pid}")
         if controller is not None:
             if task_key is None:
                 controller.register(process)
@@ -1641,6 +1651,7 @@ def run_ffmpeg(
                 **popen_options,
             )
             _track_process(process.pid)
+            say(f"[进程] 启动 FFmpeg PID {process.pid}（{label}）")
             if task_key is None:
                 controller.register(process)
             else:
@@ -5955,6 +5966,9 @@ class CodecFoundryWindow(QMainWindow):
         self.task_host = TaskHostWidget()
         self.task_host.setObjectName("contentHost")
         self.task_layout = QVBoxLayout(self.task_host)
+        # Positions are managed by _rebuild_task_sidebar's real-height stack;
+        # disable the layout's own relayout so Qt never overrides them.
+        self.task_layout.setEnabled(False)
         self.task_layout.setContentsMargins(0, 0, 0, 0)
         self.task_layout.setSpacing(6)
         self.task_layout.addStretch(1)
@@ -6743,20 +6757,66 @@ class CodecFoundryWindow(QMainWindow):
         for key in reversed(waiting_keys + other_keys):
             self.task_layout.insertWidget(0, self.task_widgets[key]["frame"])
         indicator = self._ensure_drop_indicator()
+        indicator_index: int | None = None
         if insert_key is not None and insert_key in self.waiting_order:
-            insert_index = self.waiting_order.index(insert_key)
-            self.task_layout.insertWidget(
-                min(insert_index, len(waiting_keys)), indicator
-            )
+            indicator_index = min(self.waiting_order.index(insert_key), len(waiting_keys))
+            self.task_layout.insertWidget(indicator_index, indicator)
             indicator.show()
         else:
             # takeAt() above detaches but does not hide the widget; hide it
             # explicitly so the line only exists during a manual drag.
             indicator.hide()
         self.task_layout.addStretch(1)
-        self.task_layout.activate()
+        # Stack by REAL widget heights (heightForWidth-aware), never by raw
+        # sizeHints: a card whose content grew (e.g. the "完成" summary) always
+        # pushes the next card down by its true size, so cards can never embed.
+        targets, total_height = self._stack_targets_by_real_height(
+            waiting_keys, other_keys, indicator, indicator_index
+        )
         if animate:
-            self._animate_reflow(old_positions)
+            self._animate_reflow(old_positions, targets)
+        else:
+            for key, target in targets.items():
+                self.task_widgets[key]["frame"].move(target)
+        self.task_host.setMinimumHeight(total_height)
+        self.task_layout.invalidate()
+
+    def _frame_real_height(self, frame: QFrame, width: int) -> int:
+        """True content height of a card laid out at ``width``."""
+        needed = frame.heightForWidth(max(1, width))
+        if needed > 0:
+            return needed
+        return max(frame.height(), frame.sizeHint().height(), 1)
+
+    def _stack_targets_by_real_height(
+        self,
+        waiting_keys: list[str],
+        other_keys: list[str],
+        indicator: QFrame,
+        indicator_index: int | None,
+    ) -> tuple[dict[str, QPoint], int]:
+        """Compute target positions stacking cards by their real heights."""
+        spacing = max(0, self.task_layout.spacing())
+        margins = self.task_layout.contentsMargins()
+        x = margins.left()
+        y = margins.top()
+        content_width = max(1, self.task_host.width() - margins.left() - margins.right())
+        targets: dict[str, QPoint] = {}
+        placed = 0
+        for key in waiting_keys + other_keys:
+            if indicator_index is not None and placed == indicator_index:
+                indicator.move(x, y)
+                y += indicator.height() + spacing
+            frame = self.task_widgets[key]["frame"]
+            real_height = self._frame_real_height(frame, content_width)
+            frame.resize(content_width, max(1, real_height))
+            targets[key] = QPoint(x, y)
+            y += real_height + spacing
+            placed += 1
+        if indicator_index is not None and indicator_index >= placed:
+            indicator.move(x, y)
+            y += indicator.height() + spacing
+        return targets, y + margins.bottom()
 
     def _ensure_drop_indicator(self) -> QFrame:
         if self._drop_indicator is None:
@@ -6770,29 +6830,48 @@ class CodecFoundryWindow(QMainWindow):
             self._drop_indicator = indicator
         return self._drop_indicator
 
-    def _animate_reflow(self, old_positions: dict[str, QPoint]) -> None:
-        """Glide cards from their previous to their new layout positions."""
-        for key, old_position in old_positions.items():
+    def _animate_reflow(
+        self, old_positions: dict[str, QPoint], targets: dict[str, QPoint]
+    ) -> None:
+        """Glide cards from their current to their new real-height positions.
+
+        A rebuild always wins over an older glide still in flight: the
+        previous animation for a card is stopped first, so a card can never
+        keep sliding toward an outdated target (that stale glide embedded the
+        next card after a drag).  The new glide starts from the frame's
+        CURRENT position, not the one captured before the old animation ran.
+        """
+        for key, target in targets.items():
             widgets = self.task_widgets.get(key)
             if widgets is None:
                 continue
             frame = widgets["frame"]
-            target = frame.pos()
-            if old_position == target:
-                continue
-            previous = self._reflow_animations.get(key)
+            previous = self._reflow_animations.pop(key, None)
             if previous is not None:
                 previous.stop()
+            if key not in old_positions:
+                # Brand-new card: place it directly instead of gliding it
+                # from wherever its default geometry happens to be.
+                frame.move(target)
+                continue
+            start = frame.pos()
+            if start == target:
+                continue
             animation = QPropertyAnimation(frame, b"pos", self)
             animation.setDuration(140)
-            animation.setStartValue(old_position)
+            animation.setStartValue(start)
             animation.setEndValue(target)
             animation.setEasingCurve(QEasingCurve.Type.OutCubic)
             animation.finished.connect(
-                lambda k=key: self._reflow_animations.pop(k, None)
+                lambda k=key, a=animation: self._on_reflow_animation_finished(k, a)
             )
             animation.start(QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
             self._reflow_animations[key] = animation
+
+    def _on_reflow_animation_finished(self, key: str, animation) -> None:
+        """Forget a finished glide only if it is still the registered one."""
+        if self._reflow_animations.get(key) is animation:
+            self._reflow_animations.pop(key, None)
 
     # -- manual long-press drag coordination --------------------------------
 
