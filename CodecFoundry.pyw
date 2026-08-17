@@ -311,6 +311,18 @@ class ProcessController:
         deadline = time.monotonic() + max(0.0, grace_seconds)
         while time.monotonic() < deadline and any(process.poll() is None for process in processes):
             time.sleep(0.05)
+        # Second sweep: force-stop anything still alive, including processes
+        # registered while the grace window was running.
+        with self._lock:
+            processes = list(self._processes.values())
+        for process in processes:
+            if process.poll() is None:
+                self._force_stop(process)
+
+    def force_stop_all(self) -> None:
+        """Force-stop every registered process (used after a full cancel)."""
+        with self._lock:
+            processes = list(self._processes.values())
         for process in processes:
             if process.poll() is None:
                 self._force_stop(process)
@@ -327,7 +339,12 @@ class ProcessController:
             else:
                 process.terminate()
         except (OSError, ProcessLookupError):
-            pass
+            # A console-less child cannot receive CTRL_BREAK; fall back to a
+            # plain terminate instead of waiting for the force-kill sweep.
+            try:
+                process.terminate()
+            except (OSError, ProcessLookupError):
+                pass
 
     @staticmethod
     def _force_stop(process: subprocess.Popen[str]) -> None:
@@ -2780,7 +2797,6 @@ from PySide6.QtCore import (
     Qt,
     QTimer,
     QUrl,
-    QVariantAnimation,
     Signal,
     QObject,
 )
@@ -2806,6 +2822,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QSplitter,
     QSystemTrayIcon,
@@ -2813,8 +2830,6 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-
-_QWIDGETSIZE_MAX = 16777215  # Qt's QWIDGETSIZE_MAX, not exported by every PySide6 build
 
 
 APP_NAME = "CodecFoundry"
@@ -4160,6 +4175,13 @@ class LiveScheduler:
         with self.lock:
             return bool(self.chunk_started) and not self.waiting and not self.busy
 
+    def _emit_request_failed_if_idle(self, message: str) -> None:
+        """A rejected request must not leave the GUI with a dead start button."""
+        with self.lock:
+            idle = not self.waiting and not self.busy and self.chunk_started is None
+        if idle:
+            emit_event("request_failed", text=message)
+
     def _finalize_chunk(self) -> dict[str, object]:
         with self.lock:
             tasks = list(self.chunk_tasks)
@@ -4230,9 +4252,12 @@ class LiveScheduler:
                     message = f"请求参数无效：{exc.code or exc}"
                     say(message)
                     emit_event("status", text=message)
+                    self._emit_request_failed_if_idle(message)
                 except TranscodeError as exc:
-                    say(f"错误：{exc}")
-                    emit_event("status", text=f"错误：{exc}")
+                    message = str(exc)
+                    say(f"错误：{message}")
+                    emit_event("status", text=f"错误：{message}")
+                    self._emit_request_failed_if_idle(message)
             self.dispatch()
             if stop_now:
                 with self.lock:
@@ -4414,6 +4439,13 @@ QPushButton#taskStopButton:hover {{ background: #e81123; }}
 QPushButton#taskRestartButton, QPushButton#taskOpenButton {{ background: {COLOR_BLUE}; }}
 QPushButton#taskRestartButton:hover, QPushButton#taskOpenButton:hover {{ background: {COLOR_BLUE_HOVER}; }}
 QPushButton:disabled {{ background: #3b3b3b; color: #777777; }}
+QPushButton#primaryButton:disabled, QPushButton#dangerButton:disabled,
+QPushButton#smallButton:disabled, QPushButton#taskCancelButton:disabled,
+QPushButton#taskStopButton:disabled, QPushButton#taskRestartButton:disabled,
+QPushButton#taskOpenButton:disabled, QPushButton#windowButton:disabled {{
+    background: #3b3b3b;
+    color: #777777;
+}}
 QProgressBar {{
     background: #181818;
     border: 1px solid #343434;
@@ -4535,6 +4567,8 @@ SINGLE_INSTANCE_SERVER_NAME = (
     "CodecFoundry-" + hashlib.md5(str(APP_DATA_DIR).encode("utf-8")).hexdigest()[:12]
 )
 TASK_LONG_PRESS_MS = 380
+# Shell CLSID for "This PC": the default start folder of the file dialogs.
+THIS_PC_SHELL_PATH = "::{20D04FE0-3AEA-1069-A2D8-08002B30309D}"
 
 
 def _forward_to_running_instance(argv: Sequence[str], timeout_ms: int = 1500) -> bool:
@@ -4599,11 +4633,10 @@ def _cli_request_can_forward(argv: Sequence[str]) -> bool:
 
 
 class TaskCardFrame(QFrame):
-    """Queue card: a long press shrinks it 5% (animated) and starts a Y-only drag.
-
-    While dragging, the card follows the cursor on the Y axis only; the host
-    window reflows the other cards live (auto-avoid) and inserts the card at the
-    release position.
+    """Queue card: a long press starts a Y-only drag with a highlighted border
+    and a grab cursor.  While dragging, the card follows the cursor on the Y
+    axis only; the host window reflows the other cards live (auto-avoid) and
+    inserts the card at the release position.
     """
 
     def __init__(self, parent: QWidget | None = None):
@@ -4618,9 +4651,6 @@ class TaskCardFrame(QFrame):
         self._press_timer.setSingleShot(True)
         self._press_timer.setInterval(TASK_LONG_PRESS_MS)
         self._press_timer.timeout.connect(self._begin_long_press)
-        self._scale_target = 1.0
-        self._scale_anim: QVariantAnimation | None = None
-        self._drag_original_size: QPoint | None = None
         self._grab_offset_y = 0
         self._autoscroll_delta = 0
         self._autoscroll_timer = QTimer(self)
@@ -4683,14 +4713,12 @@ class TaskCardFrame(QFrame):
             self._press_global.y() - frame_top if self._press_global is not None else 0
         )
         self._press_global = None
-        self._drag_original_size = self.size()
         self.grabMouse()
         self.raise_()
-        # Long-press feedback: shrink to 85%, highlight the border, grab cursor.
-        self._set_scale(0.85, animated=True)
-        self.setProperty("dragging", True)
-        self.style().unpolish(self)
-        self.style().polish(self)
+        # Drag feedback: highlight the border and show a grab cursor.
+        self.setStyleSheet(
+            f"QFrame#panel {{ border: 1px solid {COLOR_BLUE_HOVER}; }}"
+        )
         self.setCursor(Qt.CursorShape.ClosedHandCursor)
         self._autoscroll_timer.start()
         self._host_window.on_card_drag_started(self._task_key)
@@ -4736,48 +4764,10 @@ class TaskCardFrame(QFrame):
         self._autoscroll_timer.stop()
         self._autoscroll_delta = 0
         self.releaseMouse()
-        self._set_scale(1.0, animated=True)
-        self._release_fixed_size()
-        self.setProperty("dragging", False)
-        self.style().unpolish(self)
-        self.style().polish(self)
+        self.setStyleSheet("")
         self.unsetCursor()
         if self._host_window is not None and self._task_key is not None:
             self._host_window.on_card_drag_finished(self._task_key)
-
-    # -- 5% shrink animation (can be disabled in settings) -----------------
-
-    def _release_fixed_size(self) -> None:
-        self.setMinimumSize(0, 0)
-        self.setMaximumSize(_QWIDGETSIZE_MAX, _QWIDGETSIZE_MAX)
-
-    def _set_scale(self, scale: float, animated: bool) -> None:
-        enabled = (
-            animated
-            and self._host_window is not None
-            and getattr(self._host_window, "drag_animation_enabled", True)
-        )
-        if enabled:
-            if self._scale_anim is None:
-                self._scale_anim = QVariantAnimation(self, duration=120)
-                self._scale_anim.valueChanged.connect(self._apply_scale)
-            self._scale_anim.stop()
-            self._scale_anim.setStartValue(self._scale_target)
-            self._scale_anim.setEndValue(scale)
-            self._scale_target = scale
-            self._scale_anim.start()
-        else:
-            self._scale_target = scale
-            self._apply_scale(scale)
-
-    def _apply_scale(self, value) -> None:
-        if self._drag_original_size is None:
-            return
-        factor = float(value)
-        self.setFixedSize(
-            max(1, round(self._drag_original_size.x() * factor)),
-            max(1, round(self._drag_original_size.y() * factor)),
-        )
 
 
 class TaskHostWidget(QWidget):
@@ -5938,6 +5928,12 @@ class CodecFoundryWindow(QMainWindow):
         self.task_layout.addStretch(1)
         scroll.setWidget(self.task_host)
         layout.addWidget(scroll, 1)
+        self.retry_all_button = QPushButton("一键重试全部失败任务")
+        self.retry_all_button.setObjectName("primaryButton")
+        self.retry_all_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.retry_all_button.clicked.connect(self._retry_all_failed)
+        self.retry_all_button.hide()
+        layout.addWidget(self.retry_all_button)
         self.task_sidebar = sidebar
 
     def toggle_maximized(self) -> None:
@@ -6205,7 +6201,7 @@ class CodecFoundryWindow(QMainWindow):
         paths, _ = QFileDialog.getOpenFileNames(
             self,
             "选择视频或 FlashCut HLM",
-            "",
+            THIS_PC_SHELL_PATH,
             "视频 / HLM (*.mp4 *.mkv *.mov *.avi *.webm *.ts *.m2ts *.wmv *.m4v *.mpeg *.mpg *.HLM);;所有文件 (*.*)",
         )
         if any(Path(path).suffix.lower() == ".hlm" for path in paths):
@@ -6240,7 +6236,9 @@ class CodecFoundryWindow(QMainWindow):
         self._log(f"[HLM] 已载入：{manifest}；原片：{source}")
 
     def add_directory(self) -> None:
-        path = QFileDialog.getExistingDirectory(self, "选择视频目录")
+        path = QFileDialog.getExistingDirectory(
+            self, "选择视频目录", THIS_PC_SHELL_PATH
+        )
         if path:
             self._append_inputs([path])
 
@@ -6482,6 +6480,8 @@ class CodecFoundryWindow(QMainWindow):
             self.batch_cancelled_count = 0
             self.active_slot_files.clear()
             self.slot_states.clear()
+            self.stop_button.setEnabled(True)
+            self.start_button.setEnabled(False)
             self._ensure_slot_cards(4 if self.debug_progress_enabled else 0)
             self._reset_overall_progress("正在探测视频…")
             self._set_status("正在探测视频并安排编码任务……")
@@ -6546,10 +6546,13 @@ class CodecFoundryWindow(QMainWindow):
         threading.Thread(target=self._cancel_session, daemon=True).start()
 
     def _cancel_session(self) -> None:
-        if self.controller is not None:
-            self.controller.cancel()
+        # Stop dispatching new work first, then cancel every FFmpeg process
+        # and sweep again so nothing keeps encoding after "停止全部".
         if self.scheduler is not None:
             self.scheduler.request_shutdown()
+        if self.controller is not None:
+            self.controller.cancel()
+            self.controller.force_stop_all()
 
     def _reset_session_counters(self) -> None:
         self.total_equivalent_frames = 0.0
@@ -6699,12 +6702,17 @@ class CodecFoundryWindow(QMainWindow):
             self.task_layout.takeAt(0)
         for key in reversed(waiting_keys + other_keys):
             self.task_layout.insertWidget(0, self.task_widgets[key]["frame"])
+        indicator = self._ensure_drop_indicator()
         if insert_key is not None and insert_key in self.waiting_order:
-            indicator = self._ensure_drop_indicator()
             insert_index = self.waiting_order.index(insert_key)
             self.task_layout.insertWidget(
                 min(insert_index, len(waiting_keys)), indicator
             )
+            indicator.show()
+        else:
+            # takeAt() above detaches but does not hide the widget; hide it
+            # explicitly so the line only exists during a manual drag.
+            indicator.hide()
         self.task_layout.addStretch(1)
         self.task_layout.activate()
         if animate:
@@ -6715,6 +6723,10 @@ class CodecFoundryWindow(QMainWindow):
             indicator = QFrame()
             indicator.setObjectName("dropIndicator")
             indicator.setFixedHeight(3)
+            indicator.setSizePolicy(
+                QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+            )
+            indicator.hide()
             self._drop_indicator = indicator
         return self._drop_indicator
 
@@ -6808,6 +6820,43 @@ class CodecFoundryWindow(QMainWindow):
             self.scheduler.reorder_waiting(keys)
         self._rebuild_task_sidebar()
         self._set_status("等待队列顺序已更新，将按新顺序调度")
+
+    # -- one-click retry of failed/cancelled tasks --------------------------
+
+    def _update_retry_all_button(self) -> None:
+        if not hasattr(self, "retry_all_button"):
+            return
+        has_failed = any(
+            str(record.get("status") or "") in {"failed", "cancelled"}
+            for record in self.task_records.values()
+        )
+        can_retry = bool(self.last_batch_args and "--codec" in self.last_batch_args)
+        self.retry_all_button.setVisible(has_failed and can_retry)
+
+    def _retry_all_failed(self) -> None:
+        if self.scheduler is not None and self.scheduler.has_work():
+            QMessageBox.information(
+                self, APP_TITLE, "请先等待当前任务完成，或点击“停止全部”。"
+            )
+            return
+        retryable = [
+            (key, dict(record))
+            for key, record in self.task_records.items()
+            if str(record.get("status") or "") in {"failed", "cancelled"}
+        ]
+        if not retryable:
+            return
+        for key, record in retryable:
+            if key in self.restart_keys:
+                continue
+            self.restart_keys.add(key)
+            self.pending_restarts[key] = record
+            self._update_task_card(key, "waiting", int(record.get("slot_id") or 0))
+            if key not in self.waiting_order:
+                self.waiting_order.append(key)
+        self._rebuild_task_sidebar()
+        self._log(f"[重新开始] 一键重试 {len(retryable)} 个任务")
+        QTimer.singleShot(0, self._launch_pending_restarts)
 
     def _populate_task_sidebar(
         self,
@@ -6980,6 +7029,7 @@ class CodecFoundryWindow(QMainWindow):
         if was_waiting and status != "waiting" and task_key in self.waiting_order:
             self.waiting_order.remove(task_key)
             self._rebuild_task_sidebar(exclude_key=self._active_drag_key)
+        self._update_retry_all_button()
 
     def _handle_task_action(self, task_key: str) -> None:
         record = self.task_records.get(task_key)
@@ -7072,6 +7122,11 @@ class CodecFoundryWindow(QMainWindow):
             return
         if event_type == "batch_done":
             self.batch_cancelled_count = int(payload.get("cancelled") or 0)
+            return
+        if event_type == "request_failed":
+            self.stop_button.setEnabled(False)
+            self.start_button.setEnabled(not self.closing)
+            self._set_status(f"启动失败：{payload.get('text', '')}")
             return
         if event_type == "session_idle":
             self._handle_session_idle(payload)

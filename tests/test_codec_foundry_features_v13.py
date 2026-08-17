@@ -908,9 +908,47 @@ class FramelessResizeTests(unittest.TestCase):
             window.begin_card_drag(keys[0])
             window.on_card_drag_started(keys[0])
             self.assertIsNotNone(window._drop_indicator)
+            self.assertFalse(window._drop_indicator.isHidden())
             self.assertGreaterEqual(window.task_layout.indexOf(window._drop_indicator), 0)
             window.on_card_drag_finished(keys[0])
             self.assertEqual(window.task_layout.indexOf(window._drop_indicator), -1)
+            self.assertTrue(window._drop_indicator.isHidden())
+        finally:
+            _close_window(window)
+
+    def test_failed_request_reenables_start_button(self):
+        window = cf.CodecFoundryWindow()
+        try:
+            window.start_button.setEnabled(False)
+            window.stop_button.setEnabled(True)
+            window._handle_backend_event("request_failed", {"text": "HLM 文件不存在"})
+            self.assertTrue(window.start_button.isEnabled())
+            self.assertFalse(window.stop_button.isEnabled())
+            self.assertIn("启动失败", window.status_label.text())
+        finally:
+            _close_window(window)
+
+    def test_retry_all_button_restarts_failed_tasks(self):
+        window = cf.CodecFoundryWindow()
+        try:
+            source = str(Path("D:/video/source.mp4"))
+            failed_record = {
+                "source": source,
+                "output": str(Path("D:/out/f.mp4")),
+                "filename": "f.mp4",
+            }
+            window._create_task_card(0, failed_record, "failed")
+            window.last_batch_args = [source, "--codec", "hevc", "--cq", "23"]
+            window._update_retry_all_button()
+            self.assertFalse(window.retry_all_button.isHidden())
+            with mock.patch.object(window, "_launch_pending_restarts") as launch:
+                window._retry_all_failed()
+                self.app.processEvents()
+            self.assertIn(failed_record["output"], window.pending_restarts)
+            self.assertEqual(
+                window.task_records[failed_record["output"]]["status"], "waiting"
+            )
+            self.assertTrue(launch.called)
         finally:
             _close_window(window)
 
