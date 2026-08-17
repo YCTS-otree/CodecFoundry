@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CodecFoundry v1.3.0: single-file PySide6 NVENC transcoder.
+"""CodecFoundry v1.3.1-beta: single-file PySide6 NVENC transcoder.
 
 The backend and desktop UI intentionally live in this one source file.  The GPU
 capability database remains external data: driver/runtime discovery tells us which
@@ -119,7 +119,7 @@ VIDEO_EXTENSIONS = {
     ".3gp", ".avi", ".flv", ".m2ts", ".m4v", ".mkv", ".mov", ".mp4",
     ".mpeg", ".mpg", ".mts", ".ts", ".webm", ".wmv",
 }
-CODECFOUNDRY_VERSION = "1.3.0"
+CODECFOUNDRY_VERSION = "1.3.1-beta"
 HLM_FORMAT = "FlashCut Highlight Markers"
 SUPPORTED_HLM_VERSION = 2
 CODEC_ALIASES = {
