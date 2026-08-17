@@ -2771,7 +2771,17 @@ def main(
             signal.signal(handled_signal, previous_handler)
 
 
-from PySide6.QtCore import QEvent, QPoint, Qt, QTimer, QUrl, QVariantAnimation, Signal, QObject
+from PySide6.QtCore import (
+    QEvent,
+    QPoint,
+    QRect,
+    Qt,
+    QTimer,
+    QUrl,
+    QVariantAnimation,
+    Signal,
+    QObject,
+)
 from PySide6.QtGui import QColor, QDesktopServices, QFont, QIcon, QPalette
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
@@ -5495,6 +5505,12 @@ class CodecFoundryWindow(QMainWindow):
         self._update_check_running = False
         self._active_drag_key: str | None = None
         self._drag_index = 0
+        self._resize_edge: str | None = None
+        self._resize_start_geometry: QRect | None = None
+        self._resize_start_global: QPoint | None = None
+        app_instance = QApplication.instance()
+        if app_instance is not None:
+            app_instance.installEventFilter(self)
 
         self._build_ui()
         self._apply_preferences()
@@ -5919,60 +5935,125 @@ class CodecFoundryWindow(QMainWindow):
             self.title_bar.maximize_button.setText("□")
             self.title_bar.maximize_button.setToolTip("最大化")
 
-    def nativeEvent(self, event_type, message):
-        """Frameless window: re-enable native border resize via WM_NCHITTEST.
+    def _resize_edge_at(self, position: QPoint) -> str | None:
+        """Edge mask inside the window's 3-logical-pixel border, else None."""
+        margin = 3
+        rect = self.rect()
+        if rect.width() <= 0 or rect.height() <= 0:
+            return None
+        on_left = position.x() <= margin
+        on_right = position.x() >= rect.width() - margin
+        on_top = position.y() <= margin
+        on_bottom = position.y() >= rect.height() - margin
+        if not (on_left or on_right or on_top or on_bottom):
+            return None
+        parts = []
+        if on_left:
+            parts.append("l")
+        if on_right:
+            parts.append("r")
+        if on_top:
+            parts.append("t")
+        if on_bottom:
+            parts.append("b")
+        return "".join(parts)
 
-        WM_NCHITTEST coordinates are physical screen pixels while Qt geometry
-        is logical, so the frame rectangle is scaled by the window screen's
-        device pixel ratio before comparing; only a 3-physical-pixel border on
-        each of the four edges (and corners) triggers a resize.
+    _RESIZE_CURSORS = {
+        "l": Qt.CursorShape.SizeHorCursor,
+        "r": Qt.CursorShape.SizeHorCursor,
+        "t": Qt.CursorShape.SizeVerCursor,
+        "b": Qt.CursorShape.SizeVerCursor,
+        "lt": Qt.CursorShape.SizeFDiagCursor,
+        "rb": Qt.CursorShape.SizeFDiagCursor,
+        "rt": Qt.CursorShape.SizeBDiagCursor,
+        "lb": Qt.CursorShape.SizeBDiagCursor,
+    }
+
+    def _update_resize_cursor(self, global_position: QPoint) -> None:
+        if self.isMaximized() or self.isFullScreen():
+            return
+        edge = self._resize_edge_at(self.mapFromGlobal(global_position))
+        if edge and edge in self._RESIZE_CURSORS:
+            target = self._RESIZE_CURSORS[edge]
+            if self.cursor().shape() != target:
+                self.setCursor(target)
+        elif self.cursor().shape() != Qt.CursorShape.ArrowCursor:
+            self.unsetCursor()
+
+    def _apply_resize_delta(self, global_position: QPoint) -> None:
+        if (
+            not self._resize_edge
+            or self._resize_start_geometry is None
+            or self._resize_start_global is None
+        ):
+            return
+        delta = global_position - self._resize_start_global
+        edge = self._resize_edge
+        geometry = QRect(self._resize_start_geometry)
+        min_width = self.minimumWidth()
+        min_height = self.minimumHeight()
+        if "l" in edge:
+            geometry.setLeft(
+                min(geometry.right() - min_width, geometry.left() + delta.x())
+            )
+        if "r" in edge:
+            geometry.setRight(
+                max(geometry.left() + min_width, geometry.right() + delta.x())
+            )
+        if "t" in edge:
+            geometry.setTop(
+                min(geometry.bottom() - min_height, geometry.top() + delta.y())
+            )
+        if "b" in edge:
+            geometry.setBottom(
+                max(geometry.top() + min_height, geometry.bottom() + delta.y())
+            )
+        self.setGeometry(geometry)
+
+    def eventFilter(self, watched, event) -> bool:
+        """Frameless window: resize via a 3px border on all four edges/corners.
+
+        Everything works in Qt logical coordinates, so DPI scaling can never
+        shift the hit zone away from the visible window border.
         """
-        if os.name == "nt" and event_type == b"windows_generic_MSG":
-            try:
-                native_message = ctypes.wintypes.MSG.from_address(int(message))
-            except (ValueError, TypeError):
-                return super().nativeEvent(event_type, message)
-            if native_message.message == 0x0084:  # WM_NCHITTEST
-                if self.isMaximized() or self.isFullScreen():
-                    return super().nativeEvent(event_type, message)
-                rect = self.frameGeometry()
-                if rect.width() <= 0 or rect.height() <= 0:
-                    return super().nativeEvent(event_type, message)
-                screen = self.screen() or QApplication.primaryScreen()
-                device_ratio = screen.devicePixelRatio() if screen is not None else 1.0
-                left = round(rect.left() * device_ratio)
-                top = round(rect.top() * device_ratio)
-                right = round((rect.right() + 1) * device_ratio)
-                bottom = round((rect.bottom() + 1) * device_ratio)
-                x = ctypes.c_short(native_message.lParam & 0xFFFF).value
-                y = ctypes.c_short((native_message.lParam >> 16) & 0xFFFF).value
-                border = 3  # 仅边缘 2-3 个物理像素
-                if not (left <= x < right and top <= y < bottom):
-                    return super().nativeEvent(event_type, message)
-                on_left = x < left + border
-                on_right = x >= right - border
-                on_top = y < top + border
-                on_bottom = y >= bottom - border
-                hit = None
-                if on_top and on_left:
-                    hit = 13  # HTTOPLEFT
-                elif on_top and on_right:
-                    hit = 14  # HTTOPRIGHT
-                elif on_bottom and on_left:
-                    hit = 16  # HTBOTTOMLEFT
-                elif on_bottom and on_right:
-                    hit = 17  # HTBOTTOMRIGHT
-                elif on_left:
-                    hit = 10  # HTLEFT
-                elif on_right:
-                    hit = 11  # HTRIGHT
-                elif on_top:
-                    hit = 12  # HTTOP
-                elif on_bottom:
-                    hit = 15  # HTBOTTOM
-                if hit is not None:
-                    return True, hit
-        return super().nativeEvent(event_type, message)
+        if self.close_finalized or self.closing:
+            return super().eventFilter(watched, event)
+        event_type = event.type()
+        if event_type not in (
+            QEvent.Type.MouseButtonPress,
+            QEvent.Type.MouseMove,
+            QEvent.Type.MouseButtonRelease,
+        ):
+            return super().eventFilter(watched, event)
+        if not isinstance(watched, QWidget) or watched.window() is not self:
+            return super().eventFilter(watched, event)
+        if event_type == QEvent.Type.MouseButtonPress:
+            if (
+                event.button() == Qt.MouseButton.LeftButton
+                and not self.isMaximized()
+                and not self.isFullScreen()
+            ):
+                global_position = event.globalPosition().toPoint()
+                edge = self._resize_edge_at(self.mapFromGlobal(global_position))
+                if edge:
+                    self._resize_edge = edge
+                    self._resize_start_geometry = QRect(self.geometry())
+                    self._resize_start_global = global_position
+                    return True
+        elif event_type == QEvent.Type.MouseMove:
+            if self._resize_edge:
+                self._apply_resize_delta(event.globalPosition().toPoint())
+                return True
+            if not event.buttons():
+                self._update_resize_cursor(event.globalPosition().toPoint())
+        elif event_type == QEvent.Type.MouseButtonRelease:
+            if self._resize_edge and event.button() == Qt.MouseButton.LeftButton:
+                self._resize_edge = None
+                self._resize_start_geometry = None
+                self._resize_start_global = None
+                self.unsetCursor()
+                return True
+        return super().eventFilter(watched, event)
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -7600,6 +7681,12 @@ class CodecFoundryWindow(QMainWindow):
             return
         set_output_callback(None)
         set_event_callback(None)
+        application = QApplication.instance()
+        if application is not None:
+            try:
+                application.removeEventFilter(self)
+            except RuntimeError:
+                pass
         if self.ipc_server is not None:
             try:
                 self.ipc_server.close()

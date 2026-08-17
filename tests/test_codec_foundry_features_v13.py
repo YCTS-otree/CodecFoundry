@@ -711,88 +711,94 @@ class FramelessResizeTests(unittest.TestCase):
     def setUpClass(cls):
         cls.app = cf.QApplication.instance() or cf.QApplication([])
 
-    def test_native_hit_test_returns_border_resize_codes(self):
-        if os.name != "nt":
-            self.skipTest("WM_NCHITTEST resize is Windows-only")
+    @staticmethod
+    def _mouse_event(kind, global_pos: cf.QPoint):
+        from PySide6.QtGui import QMouseEvent
+        return QMouseEvent(
+            kind,
+            cf.QPoint(0, 0),
+            global_pos,
+            cf.Qt.MouseButton.LeftButton,
+            cf.Qt.MouseButton.LeftButton,
+            cf.Qt.KeyboardModifier.NoModifier,
+        )
+
+    def test_resize_edge_detection_is_only_3px_border(self):
         window = cf.CodecFoundryWindow()
         try:
             window.resize(1000, 800)
-            window.show()
-            self.app.processEvents()
-            rect = window.frameGeometry()
-
-            def nchit(x: int, y: int) -> int:
-                from shiboken6 import VoidPtr
-                message = cf.ctypes.wintypes.MSG()
-                message.message = 0x0084  # WM_NCHITTEST
-                message.lParam = (y << 16) | (x & 0xFFFF)
-                handled, result = window.nativeEvent(
-                    b"windows_generic_MSG", VoidPtr(cf.ctypes.addressof(message))
-                )
-                return int(result) if handled else 0
-
-            left, top = rect.left(), rect.top()
-            right_edge = rect.right() - 1  # inside the 3px physical border
-            bottom_edge = rect.bottom() - 1
-            self.assertEqual(nchit(left + 1, rect.center().y()), 10)  # HTLEFT
-            self.assertEqual(nchit(right_edge, rect.center().y()), 11)  # HTRIGHT
-            self.assertEqual(nchit(rect.center().x(), top + 1), 12)  # HTTOP
-            self.assertEqual(nchit(rect.center().x(), bottom_edge), 15)  # HTBOTTOM
-            self.assertEqual(nchit(left + 1, top + 1), 13)  # HTTOPLEFT
-            self.assertEqual(nchit(right_edge, bottom_edge), 17)  # HTBOTTOMRIGHT
-            # Inside the window (center) or beyond the 3px border: default handling
-            self.assertEqual(nchit(rect.center().x(), rect.center().y()), 0)
-            self.assertEqual(nchit(rect.right() - 8, rect.center().y()), 0)
-            self.assertEqual(nchit(rect.left() + 8, rect.center().y()), 0)
-            self.assertEqual(nchit(rect.center().x(), rect.top() + 8), 0)
-            self.assertEqual(nchit(rect.center().x(), rect.bottom() - 8), 0)
+            width, height = window.rect().width(), window.rect().height()
+            self.assertEqual(window._resize_edge_at(cf.QPoint(2, height // 2)), "l")
+            self.assertEqual(window._resize_edge_at(cf.QPoint(width - 2, height // 2)), "r")
+            self.assertEqual(window._resize_edge_at(cf.QPoint(width // 2, 2)), "t")
+            self.assertEqual(window._resize_edge_at(cf.QPoint(width // 2, height - 2)), "b")
+            self.assertEqual(window._resize_edge_at(cf.QPoint(2, 2)), "lt")
+            self.assertEqual(window._resize_edge_at(cf.QPoint(width - 2, height - 2)), "rb")
+            # Beyond the 3px border (or inside the window): no resize zone at all
+            self.assertIsNone(window._resize_edge_at(cf.QPoint(6, height // 2)))
+            self.assertIsNone(window._resize_edge_at(cf.QPoint(width - 6, height // 2)))
+            self.assertIsNone(window._resize_edge_at(cf.QPoint(width // 2, 6)))
+            self.assertIsNone(window._resize_edge_at(cf.QPoint(width // 2, height - 6)))
+            self.assertIsNone(window._resize_edge_at(cf.QPoint(width // 2, height // 2)))
         finally:
             window.app_logger.close()
             window.close_finalized = True
             window.close()
 
-    def test_native_hit_test_scales_geometry_by_device_pixel_ratio(self):
-        if os.name != "nt":
-            self.skipTest("WM_NCHITTEST resize is Windows-only")
+    def test_press_on_edge_starts_resize_and_resizes_on_move(self):
         window = cf.CodecFoundryWindow()
         try:
             window.resize(1000, 800)
             window.show()
             self.app.processEvents()
-            rect = window.frameGeometry()
+            rect = window.geometry()
+            right_edge = window.mapToGlobal(cf.QPoint(rect.width() - 2, rect.height() // 2))
+            press = self._mouse_event(cf.QEvent.Type.MouseButtonPress, right_edge)
+            self.assertTrue(window.eventFilter(window, press))
+            self.assertEqual(window._resize_edge, "r")
+            moved = self._mouse_event(cf.QEvent.Type.MouseMove, right_edge + cf.QPoint(40, 0))
+            self.assertTrue(window.eventFilter(window, moved))
+            self.assertEqual(window.width(), rect.width() + 40)
+            release = self._mouse_event(cf.QEvent.Type.MouseButtonRelease, right_edge + cf.QPoint(40, 0))
+            self.assertTrue(window.eventFilter(window, release))
+            self.assertIsNone(window._resize_edge)
+        finally:
+            window.app_logger.close()
+            window.close_finalized = True
+            window.close()
 
-            class FakeScreen:
-                def devicePixelRatio(self):
-                    return 2.0
+    def test_press_inside_window_never_resizes(self):
+        window = cf.CodecFoundryWindow()
+        try:
+            window.resize(1000, 800)
+            window.show()
+            self.app.processEvents()
+            rect = window.geometry()
+            center = window.mapToGlobal(cf.QPoint(rect.width() // 2, rect.height() // 2))
+            press = self._mouse_event(cf.QEvent.Type.MouseButtonPress, center)
+            self.assertFalse(window.eventFilter(window, press))
+            self.assertIsNone(window._resize_edge)
+        finally:
+            window.app_logger.close()
+            window.close_finalized = True
+            window.close()
 
-            def nchit(x: int, y: int) -> int:
-                from shiboken6 import VoidPtr
-                message = cf.ctypes.wintypes.MSG()
-                message.message = 0x0084
-                message.lParam = (y << 16) | (x & 0xFFFF)
-                handled, result = window.nativeEvent(
-                    b"windows_generic_MSG", VoidPtr(cf.ctypes.addressof(message))
-                )
-                return int(result) if handled else 0
-
-            # lParam is physical pixels: logical rect * 2.
-            left = rect.left() * 2
-            top = rect.top() * 2
-            right = (rect.right() + 1) * 2
-            bottom = (rect.bottom() + 1) * 2
-            center_x = (left + right) // 2
-            center_y = (top + bottom) // 2
-            with mock.patch.object(window, "screen", return_value=FakeScreen()):
-                self.assertEqual(nchit(left + 1, center_y), 10)  # HTLEFT
-                self.assertEqual(nchit(right - 1, center_y), 11)  # HTRIGHT
-                self.assertEqual(nchit(center_x, top + 1), 12)  # HTTOP
-                self.assertEqual(nchit(center_x, bottom - 1), 15)  # HTBOTTOM
-                self.assertEqual(nchit(left + 1, top + 1), 13)  # HTTOPLEFT
-                self.assertEqual(nchit(right - 1, bottom - 1), 17)  # HTBOTTOMRIGHT
-                # Physical points well inside the window must NOT resize.
-                self.assertEqual(nchit(center_x, center_y), 0)
-                self.assertEqual(nchit(right - 12, center_y), 0)
-                self.assertEqual(nchit(center_x, bottom - 12), 0)
+    def test_minimum_size_is_respected_while_resizing(self):
+        window = cf.CodecFoundryWindow()
+        try:
+            window.resize(1000, 800)
+            window.show()
+            self.app.processEvents()
+            rect = window.geometry()
+            left_edge = window.mapToGlobal(cf.QPoint(2, rect.height() // 2))
+            press = self._mouse_event(cf.QEvent.Type.MouseButtonPress, left_edge)
+            window.eventFilter(window, press)
+            self.assertEqual(window._resize_edge, "l")
+            moved = self._mouse_event(cf.QEvent.Type.MouseMove, left_edge + cf.QPoint(5000, 0))
+            window.eventFilter(window, moved)
+            self.assertGreaterEqual(window.width(), window.minimumWidth())
+            release = self._mouse_event(cf.QEvent.Type.MouseButtonRelease, left_edge)
+            window.eventFilter(window, release)
         finally:
             window.app_logger.close()
             window.close_finalized = True
