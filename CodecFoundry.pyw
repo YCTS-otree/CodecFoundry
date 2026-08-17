@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CodecFoundry v1.2.0: single-file PySide6 NVENC transcoder.
+"""CodecFoundry v1.3.0: single-file PySide6 NVENC transcoder.
 
 The backend and desktop UI intentionally live in this one source file.  The GPU
 capability database remains external data: driver/runtime discovery tells us which
@@ -119,7 +119,7 @@ VIDEO_EXTENSIONS = {
     ".3gp", ".avi", ".flv", ".m2ts", ".m4v", ".mkv", ".mov", ".mp4",
     ".mpeg", ".mpg", ".mts", ".ts", ".webm", ".wmv",
 }
-CODECFOUNDRY_VERSION = "1.2.0"
+CODECFOUNDRY_VERSION = "1.3.0"
 HLM_FORMAT = "FlashCut Highlight Markers"
 SUPPORTED_HLM_VERSION = 2
 CODEC_ALIASES = {
@@ -2771,8 +2771,8 @@ def main(
             signal.signal(handled_signal, previous_handler)
 
 
-from PySide6.QtCore import QByteArray, QMimeData, QPoint, Qt, QTimer, QUrl, Signal, QObject
-from PySide6.QtGui import QColor, QDesktopServices, QDrag, QFont, QIcon, QPalette
+from PySide6.QtCore import QPoint, Qt, QTimer, QUrl, QVariantAnimation, Signal, QObject
+from PySide6.QtGui import QColor, QDesktopServices, QFont, QIcon, QPalette
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -2801,6 +2801,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+_QWIDGETSIZE_MAX = 16777215  # Qt's QWIDGETSIZE_MAX, not exported by every PySide6 build
+
 
 APP_NAME = "CodecFoundry"
 APP_VERSION = CODECFOUNDRY_VERSION
@@ -2823,28 +2825,35 @@ APP_SETTINGS_PATH = APP_DATA_DIR / "settings.json"
 # ======================================================================
 # FFmpeg / ffprobe runtime provisioning
 #
-# CodecFoundry always prefers its own FFmpeg build installed under
-# %APPDATA%\CodecFoundry\ffmpeg (never touching C:\Windows or the system
-# PATH).  Anything older than 5.1 cannot parse ``-fps_mode`` and would fail
-# with "Unrecognized option 'fps_mode'".
+# Resolution order: CodecFoundry's own install under %APPDATA%\CodecFoundry\ffmpeg,
+# then a FlashCut / DJI DPVC install under %APPDATA%, then the system PATH, and
+# finally a fresh download.  GitHub (GyanD/codexffmpeg) and the Gitee mirror are
+# requested concurrently and the fastest complete download wins; gyan.dev is only
+# a last resort.  Anything older than 5.1 cannot parse ``-fps_mode``.
 # ======================================================================
 
 MIN_FFMPEG_VERSION = (5, 1)
 FFMPEG_INSTALL_DIR = APP_DATA_DIR / "ffmpeg"
-# Domestic download source and archive layout follow CPVC exactly.
-FFMPEG_DOWNLOAD_BASE_URL = (
-    "https://gitee.com/otreee/ffmpeg_build/releases/download/2026-02-09-git-9bfa1635ae"
+FFMPEG_GITHUB_RELEASES_API = (
+    "https://api.github.com/repos/GyanD/codexffmpeg/releases/latest"
 )
-FFMPEG_DOWNLOAD_ARCHIVES = {
-    "ffmpeg.zip": "ffmpeg.exe",
-    "ffprobe.zip": "ffprobe.exe",
-}
-FFMPEG_RELEASES_PAGE_URL = "https://gitee.com/otreee/ffmpeg_build/releases"
-FFMPEG_DOWNLOAD_RETRIES = 5
+FFMPEG_GITEE_RELEASES_API = (
+    "https://gitee.com/api/v5/repos/otreee/ffmpeg_build/releases/latest"
+)
+FFMPEG_GYAN_FALLBACK_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-full.7z"
+FFMPEG_GITHUB_PAGE = "https://github.com/GyanD/codexffmpeg/releases"
+FFMPEG_GITEE_PAGE = "https://gitee.com/otreee/ffmpeg_build/releases"
+FFMPEG_EXTERNAL_APP_DIRS = ("FlashCut", "DJI-DPVC", "DJI DPVC", "DJI_DPVC")
+FFMPEG_DOWNLOAD_RETRIES = 2
 FFMPEG_INSTALL_RETRY_SECONDS = 10 * 60
 
 _ffmpeg_runtime_lock = threading.Lock()
 _ffmpeg_runtime_cache: tuple[Path, Path] | None = None
+_ffmpeg_installed_this_run = False
+
+
+class _DownloadAborted(Exception):
+    """A racing download lost to a faster source."""
 
 
 def _ffmpeg_binary_names() -> tuple[str, str]:
@@ -2861,59 +2870,134 @@ def _tool_version_tuple(executable: Path | str) -> tuple[int, int, int, int] | N
         return None
     lines = completed.stdout.splitlines()
     first_line = lines[0] if lines else ""
-    return _version_tuple(first_line)
+    version = _version_tuple(first_line)
+    if version is not None:
+        return version
+    # gyan.dev git builds carry no dotted version:
+    # "ffmpeg version git-2026-02-09-9bfa1635ae-essentials_build-..." -> use the date.
+    match = re.search(r"\bgit-(\d{4})-(\d{2})-(\d{2})-", first_line)
+    if match:
+        return (int(match.group(1)), int(match.group(2)), int(match.group(3)), 0)
+    return None
 
 
 def ffmpeg_version_ok(executable: Path | str) -> bool:
     """Return True when the executable runs and is new enough for -fps_mode."""
     version = _tool_version_tuple(executable)
-    return version is not None and version >= MIN_FFMPEG_VERSION
+    if version is None:
+        return False
+    if version[0] >= 1900:
+        # git-build date tuple (e.g. git-2026-02-09): 5.1 shipped 2022-07.
+        return version >= (2022, 7, 1, 0)
+    return version >= MIN_FFMPEG_VERSION
 
 
-def _emit_ffmpeg_setup(stage: str, name: str = "", detail: str = "", progress: float | None = None) -> None:
+def _emit_ffmpeg_setup(
+    stage: str,
+    name: str = "",
+    detail: str = "",
+    done: int = 0,
+    total: int = 0,
+    speed: float = 0.0,
+    eta: float | None = None,
+) -> None:
     payload: dict[str, object] = {"stage": stage, "name": name, "detail": detail}
-    if progress is not None:
-        payload["progress"] = progress
-    emit_event("ffmpeg_setup", **payload)
-    if stage == "download" and progress is not None:
-        say(f"[FFmpeg] 正在下载 {name} … {progress * 100:.0f}%")
-    elif detail:
-        say(f"[FFmpeg] {detail}")
+    if stage == "download":
+        payload["done"] = done
+        payload["total"] = total
+        payload["progress"] = (done / total) if total > 0 else None
+        payload["speed"] = speed
+        payload["eta"] = eta
+        emit_event("ffmpeg_setup", **payload)
+        percent = f" {done / total * 100:.0f}%" if total > 0 else ""
+        eta_text = f" · 剩余 {int(eta)}s" if eta else ""
+        say(
+            f"[FFmpeg] 正在下载 {name} …{percent}"
+            f" · {format_file_size(speed)}/s{eta_text}"
+        )
+    else:
+        emit_event("ffmpeg_setup", **payload)
+        if detail:
+            say(f"[FFmpeg] {detail}")
 
 
-def _download_ffmpeg_archive(url: str, save_path: Path, retries: int, progress_callback=None) -> bool:
+def _download_archive(
+    url: str,
+    save_path: Path,
+    retries: int = FFMPEG_DOWNLOAD_RETRIES,
+    progress_callback=None,
+    abort_event: threading.Event | None = None,
+    label: str | None = None,
+    referer: str | None = None,
+) -> bool:
+    """Download one archive to ``save_path`` via a ``.part`` temp file.
+
+    Interrupted downloads leave only ``*.part`` files, which are deleted before
+    the next attempt; ``abort_event`` lets a racing download cancel its peers.
+    """
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/122.0.0.0 Safari/537.36"
         ),
-        "Referer": "https://gitee.com/",
     }
+    if referer:
+        headers["Referer"] = referer
+    display_name = label or save_path.name
+    part_path = save_path.with_name(save_path.name + ".part")
     for attempt in range(1, retries + 1):
         try:
+            part_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        downloaded = 0
+        started = time.monotonic()
+        last_tick = started
+        last_bytes = 0
+        speed = 0.0
+        try:
             request = Request(url, headers=headers)
-            with urlopen(request, timeout=60) as response, open(save_path, "wb") as output:
+            with urlopen(request, timeout=60) as response, open(part_path, "wb") as output:
                 total_size = int(response.headers.get("Content-Length") or 0)
-                downloaded = 0
                 while True:
                     chunk = response.read(128 * 1024)
                     if not chunk:
                         break
+                    if abort_event is not None and abort_event.is_set():
+                        raise _DownloadAborted()
                     output.write(chunk)
                     downloaded += len(chunk)
-                    if progress_callback:
-                        progress_callback(downloaded, total_size)
+                    now = time.monotonic()
+                    if now - last_tick >= 0.25:
+                        speed = (downloaded - last_bytes) / max(0.001, now - last_tick)
+                        last_bytes = downloaded
+                        last_tick = now
+                        eta = (
+                            (total_size - downloaded) / speed
+                            if total_size > 0 and speed > 0
+                            else None
+                        )
+                        if progress_callback:
+                            progress_callback(
+                                "download", display_name, downloaded, total_size, speed, eta
+                            )
+            os.replace(part_path, save_path)
+            if progress_callback:
+                progress_callback("download", display_name, downloaded, total_size, speed, None)
             return True
+        except _DownloadAborted:
+            warn(f"[FFmpeg] 已放弃较慢的下载源：{display_name}")
+            return False
         except Exception as exc:
             warn(f"[FFmpeg] 下载失败（第 {attempt}/{retries} 次）：{url}：{exc}")
             try:
-                save_path.unlink(missing_ok=True)
+                part_path.unlink(missing_ok=True)
             except OSError:
                 pass
             if attempt >= retries:
                 return False
-            time.sleep(min(2 ** attempt, 20))
+            time.sleep(min(2 ** attempt, 10))
     return False
 
 
@@ -2927,31 +3011,266 @@ def _find_file_in_tree(search_root: Path, file_name: str) -> Path | None:
     return None
 
 
-def _adopt_ffmpeg_from_path(install_dir: Path) -> bool:
-    """Reuse an already-installed, sufficiently new FFmpeg by copying it in."""
-    adopted = False
-    for tool_name in ("ffmpeg", "ffprobe"):
-        target_name = f"{tool_name}.exe" if os.name == "nt" else tool_name
-        target = install_dir / target_name
-        if ffmpeg_version_ok(target):
-            continue
-        found = shutil.which(tool_name)
-        if found and ffmpeg_version_ok(Path(found)):
-            try:
-                shutil.copy2(found, target)
-                adopted = True
-                say(f"[FFmpeg] 已把可用的 {target_name} 复制到应用目录")
-            except OSError as exc:
-                warn(f"[FFmpeg] 复制 {found} 失败：{exc}")
+def _find_external_ffmpeg() -> tuple[Path, Path] | None:
+    """Reuse FlashCut / DJI DPVC's FFmpeg under %APPDATA%, then the system PATH."""
     ffmpeg_name, ffprobe_name = _ffmpeg_binary_names()
-    return ffmpeg_version_ok(install_dir / ffmpeg_name) and ffmpeg_version_ok(
-        install_dir / ffprobe_name
+    appdata_root = Path(
+        os.environ.get("APPDATA") or (Path.home() / "AppData" / "Roaming")
     )
+    for dir_name in FFMPEG_EXTERNAL_APP_DIRS:
+        root = appdata_root / dir_name
+        if not root.is_dir():
+            continue
+        ffmpeg = _find_file_in_tree(root, ffmpeg_name)
+        ffprobe = _find_file_in_tree(root, ffprobe_name)
+        if (
+            ffmpeg is not None
+            and ffprobe is not None
+            and ffmpeg_version_ok(ffmpeg)
+            and ffmpeg_version_ok(ffprobe)
+        ):
+            say(f"[FFmpeg] 复用 {dir_name} 自带的 FFmpeg：{ffmpeg.parent}")
+            return ffmpeg, ffprobe
+        warn(f"[FFmpeg] {dir_name} 目录存在，但其中的 FFmpeg 缺失或版本过旧，已跳过")
+    path_ffmpeg = shutil.which("ffmpeg")
+    path_ffprobe = shutil.which("ffprobe")
+    if (
+        path_ffmpeg
+        and path_ffprobe
+        and ffmpeg_version_ok(path_ffmpeg)
+        and ffmpeg_version_ok(path_ffprobe)
+    ):
+        say(f"[FFmpeg] 使用系统 PATH 中的 FFmpeg：{Path(path_ffmpeg).parent}")
+        return Path(path_ffmpeg), Path(path_ffprobe)
+    return None
 
 
-def _install_ffmpeg_binaries(install_dir: Path) -> bool:
-    if _adopt_ffmpeg_from_path(install_dir):
+@dataclass
+class FfmpegSource:
+    key: str
+    label: str
+    archives: list[tuple[str, str]]  # (file name, url)
+
+
+def _parse_github_ffmpeg_assets() -> list[tuple[str, str]] | None:
+    """Auto-parse the latest GyanD/codexffmpeg release assets from GitHub."""
+    data = _fetch_update_json(
+        FFMPEG_GITHUB_RELEASES_API,
+        UPDATE_RELEASE_TIMEOUT,
+        accept_header="application/vnd.github+json",
+    )
+    if not data:
+        return None
+    assets = data.get("assets")
+    if not isinstance(assets, list):
+        return None
+    primary: tuple[str, str] | None = None
+    fallback: tuple[str, str] | None = None
+    for asset in assets:
+        if not isinstance(asset, dict):
+            continue
+        name = str(asset.get("name") or "")
+        url = str(asset.get("browser_download_url") or "")
+        if not name or not url:
+            continue
+        lower = name.lower()
+        if not lower.endswith((".zip", ".7z")):
+            continue
+        if fallback is None:
+            fallback = (name, url)
+        if "full_build" in lower:
+            primary = (name, url)
+            break
+    chosen = primary or fallback
+    return [chosen] if chosen else None
+
+
+def _parse_gitee_ffmpeg_assets() -> list[tuple[str, str]] | None:
+    """Auto-parse the latest otreee/ffmpeg_build release assets from Gitee."""
+    data = _fetch_update_json(FFMPEG_GITEE_RELEASES_API, UPDATE_RELEASE_TIMEOUT)
+    if not data:
+        return None
+    assets = data.get("assets")
+    if not isinstance(assets, list):
+        return None
+    result: list[tuple[str, str]] = []
+    for asset in assets:
+        if not isinstance(asset, dict):
+            continue
+        name = str(asset.get("name") or "")
+        url = str(asset.get("browser_download_url") or "")
+        if name and url and name.lower().endswith((".zip", ".7z")):
+            result.append((name, url))
+    return result or None
+
+
+def _extract_archive(archive_path: Path, extract_dir: Path) -> bool:
+    extract_dir.mkdir(parents=True, exist_ok=True)
+    if archive_path.suffix.lower() == ".7z":
+        try:
+            import py7zr  # type: ignore
+        except ImportError:
+            py7zr = None
+        if py7zr is not None:
+            try:
+                with py7zr.SevenZipFile(archive_path, mode="r") as archive:
+                    archive.extractall(extract_dir)
+                return True
+            except Exception as exc:
+                warn(f"[FFmpeg] py7zr 解压失败：{exc}")
+                return False
+        seven_zip = shutil.which("7z") or shutil.which("7za")
+        if seven_zip:
+            completed = run_captured_text(
+                [seven_zip, "x", str(archive_path), f"-o{extract_dir}", "-y"]
+            )
+            if completed.returncode == 0:
+                return True
+            warn(f"[FFmpeg] 系统 7z 解压失败：{error_tail(completed.stderr)}")
+        else:
+            warn("[FFmpeg] 无法解压 .7z：需要 py7zr 或系统 7-Zip")
+        return False
+    try:
+        with ZipFile(archive_path) as zip_file:
+            zip_file.extractall(extract_dir)
         return True
+    except (OSError, BadZipFile) as exc:
+        warn(f"[FFmpeg] 解压 {archive_path.name} 失败：{exc}")
+        return False
+
+
+def _cleanup_stale_downloads(install_dir: Path) -> None:
+    """Remove partial/interrupted archives left by an abnormal exit (#8)."""
+    for pattern in ("*.part", "*.zip", "*.7z"):
+        for stale in install_dir.glob(pattern):
+            try:
+                stale.unlink()
+            except OSError:
+                pass
+    for leftover in install_dir.glob(".dl-*"):
+        if leftover.is_dir():
+            shutil.rmtree(leftover, ignore_errors=True)
+
+
+def _ffmpeg_progress(
+    callback,
+    stage: str,
+    name: str = "",
+    detail: str = "",
+    done: int = 0,
+    total: int = 0,
+    speed: float = 0.0,
+    eta: float | None = None,
+) -> None:
+    """Route progress to a GUI callback when present, else to log/events."""
+    if callback is not None:
+        callback(stage, name, done, total, speed, eta)
+        if detail and stage != "download":
+            say(f"[FFmpeg] {detail}")
+    else:
+        _emit_ffmpeg_setup(
+            stage, name=name, detail=detail, done=done, total=total, speed=speed, eta=eta
+        )
+
+
+def _install_from_source(
+    install_dir: Path,
+    source: FfmpegSource,
+    progress_callback,
+    abort_event: threading.Event | None,
+    ffmpeg_name: str,
+    ffprobe_name: str,
+) -> bool:
+    """Download and extract one source's archives, then verify both binaries."""
+    work_dir = install_dir / f".dl-{source.key}"
+    shutil.rmtree(work_dir, ignore_errors=True)
+    work_dir.mkdir(parents=True, exist_ok=True)
+    extracted_root = work_dir / "extracted"
+    for name, url in source.archives:
+        if abort_event is not None and abort_event.is_set():
+            return False
+        archive_path = work_dir / name
+        referer = "https://gitee.com/" if "gitee.com" in url else None
+        if not _download_archive(
+            url,
+            archive_path,
+            FFMPEG_DOWNLOAD_RETRIES,
+            progress_callback,
+            abort_event,
+            label=f"[{source.label}] {name}",
+            referer=referer,
+        ):
+            return False
+        _ffmpeg_progress(
+            progress_callback, "extract", name=name, detail=f"正在解压 {name}"
+        )
+        if not _extract_archive(archive_path, extracted_root):
+            return False
+    found: dict[str, Path] = {}
+    for binary in (ffmpeg_name, ffprobe_name):
+        path = _find_file_in_tree(extracted_root, binary)
+        if path is None:
+            warn(f"[FFmpeg] {source.label} 压缩包中没有找到 {binary}")
+            continue
+        found[binary] = path
+    if len(found) != 2:
+        warn(f"[FFmpeg] {source.label} 缺少 ffmpeg/ffprobe，来源不可用")
+        return False
+    for binary, path in found.items():
+        target = install_dir / binary
+        try:
+            target.unlink(missing_ok=True)
+        except OSError:
+            pass
+        shutil.move(str(path), str(target))
+        if not ffmpeg_version_ok(target):
+            warn(f"[FFmpeg] {binary} 安装后版本检查失败，已删除")
+            try:
+                target.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return False
+        say(f"[FFmpeg] 已安装 {binary}（来源：{source.label}）")
+    return True
+
+
+def _race_ffmpeg_sources(
+    install_dir: Path,
+    sources: Sequence[FfmpegSource],
+    progress_callback,
+    ffmpeg_name: str,
+    ffprobe_name: str,
+) -> bool:
+    """Download all sources concurrently; the fastest complete install wins."""
+    winner = threading.Event()
+    results: dict[str, bool] = {}
+
+    def attempt(source: FfmpegSource) -> None:
+        try:
+            results[source.key] = _install_from_source(
+                install_dir, source, progress_callback, winner, ffmpeg_name, ffprobe_name
+            )
+        except Exception as exc:
+            warn(f"[FFmpeg] {source.label} 安装异常：{exc}")
+            results[source.key] = False
+        finally:
+            if results.get(source.key):
+                winner.set()
+
+    threads = [
+        threading.Thread(target=attempt, args=(source,), daemon=True)
+        for source in sources
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    return any(results.get(source.key) for source in sources)
+
+
+def _install_ffmpeg_binaries(install_dir: Path, progress_callback=None) -> bool:
+    global _ffmpeg_installed_this_run
+    _cleanup_stale_downloads(install_dir)
     marker = install_dir / ".install_failed"
     if marker.is_file():
         try:
@@ -2959,67 +3278,59 @@ def _install_ffmpeg_binaries(install_dir: Path) -> bool:
         except OSError:
             age = FFMPEG_INSTALL_RETRY_SECONDS
         if age < FFMPEG_INSTALL_RETRY_SECONDS:
-            warn("[FFmpeg] 自动安装最近失败过，本次跳过重复下载；"
-                 f"可删除 {marker.name} 后重试")
-            return False
-    say(f"[FFmpeg] 正在从国内镜像下载（{FFMPEG_DOWNLOAD_BASE_URL}）……")
-    for archive, binary in FFMPEG_DOWNLOAD_ARCHIVES.items():
-        target = install_dir / binary
-        if ffmpeg_version_ok(target):
-            continue
-        download_url = f"{FFMPEG_DOWNLOAD_BASE_URL}/{archive}"
-        archive_path = install_dir / archive
-
-        def progress(done: int, total: int) -> None:
-            _emit_ffmpeg_setup(
-                "download",
-                name=archive,
-                progress=(done / total) if total > 0 else None,
+            warn(
+                "[FFmpeg] 自动安装最近失败过，本次跳过重复下载；"
+                f"可删除 {marker.name} 后重试"
             )
-
-        if not _download_ffmpeg_archive(download_url, archive_path, FFMPEG_DOWNLOAD_RETRIES, progress):
-            continue
-        try:
-            _emit_ffmpeg_setup("extract", name=archive, detail=f"正在解压 {archive}")
-            extract_dir = install_dir / ".extract"
-            shutil.rmtree(extract_dir, ignore_errors=True)
-            with ZipFile(archive_path) as zip_file:
-                zip_file.extractall(extract_dir)
-            extracted = _find_file_in_tree(extract_dir, binary)
-            if extracted is None:
-                warn(f"[FFmpeg] 压缩包中没有找到 {binary}")
-                continue
-            try:
-                target.unlink(missing_ok=True)
-            except OSError:
-                pass
-            shutil.move(str(extracted), str(target))
-            shutil.rmtree(extract_dir, ignore_errors=True)
-        except (OSError, BadZipFile) as exc:
-            warn(f"[FFmpeg] 解压/安装 {binary} 失败：{exc}")
-        finally:
-            try:
-                archive_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-        if ffmpeg_version_ok(target):
-            say(f"[FFmpeg] 已安装 {binary}")
+            return False
     ffmpeg_name, ffprobe_name = _ffmpeg_binary_names()
-    success = ffmpeg_version_ok(install_dir / ffmpeg_name) and ffmpeg_version_ok(
-        install_dir / ffprobe_name
+    github_assets = _parse_github_ffmpeg_assets()
+    gitee_assets = _parse_gitee_ffmpeg_assets()
+    sources: list[FfmpegSource] = []
+    if github_assets:
+        sources.append(
+            FfmpegSource("github", "GitHub（GyanD/codexffmpeg）", github_assets)
+        )
+    if gitee_assets:
+        sources.append(
+            FfmpegSource("gitee", "Gitee 镜像（otreee/ffmpeg_build）", gitee_assets)
+        )
+    if sources:
+        _ffmpeg_progress(
+            progress_callback,
+            "start",
+            detail="同时向 GitHub 与 Gitee 发起下载请求，最快完成者生效……",
+        )
+        if _race_ffmpeg_sources(
+            install_dir, sources, progress_callback, ffmpeg_name, ffprobe_name
+        ):
+            _ffmpeg_installed_this_run = True
+            return True
+        warn("[FFmpeg] GitHub / Gitee 下载均未完成，尝试 gyan.dev 兜底……")
+    else:
+        warn("[FFmpeg] 未能获取 GitHub / Gitee 下载信息，直接使用 gyan.dev 兜底")
+    gyan_source = FfmpegSource(
+        "gyan",
+        "gyan.dev",
+        [("ffmpeg-release-full.7z", FFMPEG_GYAN_FALLBACK_URL)],
     )
-    if not success:
-        try:
-            marker.touch()
-        except OSError:
-            pass
-    return success
+    if _install_from_source(
+        install_dir, gyan_source, progress_callback, None, ffmpeg_name, ffprobe_name
+    ):
+        _ffmpeg_installed_this_run = True
+        return True
+    try:
+        marker.touch()
+    except OSError:
+        pass
+    return False
 
 
-def ensure_ffmpeg_runtime() -> tuple[Path, Path]:
-    """Return CodecFoundry-owned FFmpeg/ffprobe, installing them when needed.
+def ensure_ffmpeg_runtime(progress_callback=None) -> tuple[Path, Path]:
+    """Return CodecFoundry-usable FFmpeg/ffprobe, installing them when needed.
 
-    Raises TranscodeError only when no usable FFmpeg can be provided at all.
+    Order: own install → FlashCut / DJI DPVC under %APPDATA% → system PATH →
+    fresh download.  Raises TranscodeError only when nothing usable exists.
     """
     global _ffmpeg_runtime_cache
     with _ffmpeg_runtime_lock:
@@ -3031,41 +3342,68 @@ def ensure_ffmpeg_runtime() -> tuple[Path, Path]:
             install_dir.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             raise TranscodeError(f"无法创建 FFmpeg 安装目录 {install_dir}：{exc}") from exc
-        ffmpeg_exe = install_dir / ffmpeg_name
-        ffprobe_exe = install_dir / ffprobe_name
-        if not (ffmpeg_version_ok(ffmpeg_exe) and ffmpeg_version_ok(ffprobe_exe)):
-            _emit_ffmpeg_setup(
-                "start",
-                detail="本地 FFmpeg 缺失或版本过旧（需要 >= 5.1 以支持 -fps_mode），正在自动修复",
-            )
-            _install_ffmpeg_binaries(install_dir)
-        if ffmpeg_version_ok(ffmpeg_exe) and ffmpeg_version_ok(ffprobe_exe):
-            _emit_ffmpeg_setup("done", detail="应用自带 FFmpeg 已就绪")
-            _ffmpeg_runtime_cache = (ffmpeg_exe, ffprobe_exe)
+        own_ffmpeg = install_dir / ffmpeg_name
+        own_ffprobe = install_dir / ffprobe_name
+        if ffmpeg_version_ok(own_ffmpeg) and ffmpeg_version_ok(own_ffprobe):
+            _ffmpeg_runtime_cache = (own_ffmpeg, own_ffprobe)
             return _ffmpeg_runtime_cache
-        # Last resort: a sufficiently new system FFmpeg, used with a warning.
-        path_ffmpeg = shutil.which("ffmpeg")
-        path_ffprobe = shutil.which("ffprobe")
-        if (
-            path_ffmpeg
-            and path_ffprobe
-            and ffmpeg_version_ok(path_ffmpeg)
-            and ffmpeg_version_ok(path_ffprobe)
-        ):
-            warn("FFmpeg 自动安装失败；本次临时使用系统 PATH 中的新版本 FFmpeg（应用目录版本优先）")
-            _ffmpeg_runtime_cache = (Path(path_ffmpeg), Path(path_ffprobe))
+        external = _find_external_ffmpeg()
+        if external is not None:
+            _ffmpeg_runtime_cache = external
+            return _ffmpeg_runtime_cache
+        _ffmpeg_progress(
+            progress_callback,
+            "start",
+            detail="本地 FFmpeg 缺失或版本过旧（需要 >= 5.1 以支持 -fps_mode），正在自动安装",
+        )
+        installed = _install_ffmpeg_binaries(install_dir, progress_callback)
+        if installed and ffmpeg_version_ok(own_ffmpeg) and ffmpeg_version_ok(own_ffprobe):
+            _ffmpeg_progress(progress_callback, "done", detail="应用自带 FFmpeg 已就绪")
+            _ffmpeg_runtime_cache = (own_ffmpeg, own_ffprobe)
             return _ffmpeg_runtime_cache
         emit_event(
             "ffmpeg_failed",
-            detail="缺少可用 FFmpeg（需要 >= 5.1）",
-            page=FFMPEG_RELEASES_PAGE_URL,
+            detail="FFmpeg 自动安装失败（需要 >= 5.1）",
+            github_page=FFMPEG_GITHUB_PAGE,
+            gitee_page=FFMPEG_GITEE_PAGE,
             install_dir=str(install_dir),
         )
         raise TranscodeError(
-            "缺少可用的 FFmpeg/ffprobe（需要 >= 5.1 以支持 -fps_mode）。\n"
+            "FFmpeg 自动安装失败（需要 >= 5.1 以支持 -fps_mode）。\n"
             f"自动安装目录：{install_dir}\n"
-            "请检查网络后重试，或手动从下载页取得 ffmpeg.exe / ffprobe.exe 放入该目录。"
+            "请检查网络后重试，或手动下载 ffmpeg.exe / ffprobe.exe 放入该目录。"
         )
+
+
+def ffmpeg_installed_this_run() -> bool:
+    """Whether the running process performed a fresh FFmpeg installation."""
+    return _ffmpeg_installed_this_run
+
+
+def copy_ffmpeg_to_system(install_dir: Path) -> bool:
+    """Optional global install: UAC-elevated copy of both binaries to C:\\Windows."""
+    ffmpeg_name, ffprobe_name = _ffmpeg_binary_names()
+    command = (
+        f'xcopy "{install_dir / ffmpeg_name}" "C:\\Windows\\" /Y & '
+        f'xcopy "{install_dir / ffprobe_name}" "C:\\Windows\\" /Y'
+    )
+    powershell_command = (
+        "Start-Process cmd -Verb RunAs "
+        f"-ArgumentList '/c {command}' -Wait"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell", "-Command", powershell_command],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=300,
+            creationflags=windows_creation_flags(),
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        warn(f"[FFmpeg] 全局安装失败：{exc}")
+        return False
+    return result.returncode == 0
 
 
 def resolve_ffmpeg_toolchain(
@@ -3074,7 +3412,7 @@ def resolve_ffmpeg_toolchain(
     explicit_ffmpeg: bool = False,
     explicit_ffprobe: bool = False,
 ) -> tuple[str, str]:
-    """Pick FFmpeg/ffprobe paths: explicit CLI paths win, otherwise own builds."""
+    """Pick FFmpeg/ffprobe paths: explicit CLI paths win, otherwise resolved ones."""
     if explicit_ffmpeg and explicit_ffprobe:
         return str(default_ffmpeg), str(default_ffprobe)
     ffmpeg_exe, ffprobe_exe = ensure_ffmpeg_runtime()
@@ -3089,15 +3427,16 @@ def resolve_ffmpeg_toolchain(
 # ======================================================================
 
 UPDATE_INFO_URLS = [
-    "https://gitee.com/otreee/CodecFoundry/raw/main/update.json",
-    "https://raw.githubusercontent.com/YCTS-otree/CodecFoundry/main/update.json",
+    # GitHub first: when the global network is reachable it wins the preference.
+    "https://raw.githubusercontent.com/YCTS-otree/CodecFoundry/master/update.json",
+    "https://gitee.com/otreee/CodecFoundry/raw/master/update.json",
 ]
 RELEASE_INFO_URLS = [
-    "https://gitee.com/api/v5/repos/otreee/CodecFoundry/releases/latest",
     "https://api.github.com/repos/YCTS-otree/CodecFoundry/releases/latest",
+    "https://gitee.com/api/v5/repos/otreee/CodecFoundry/releases/latest",
 ]
-UPDATE_HTTP_TIMEOUT = 2.0
-UPDATE_RELEASE_TIMEOUT = 5.0
+UPDATE_HTTP_TIMEOUT = 4.0
+UPDATE_RELEASE_TIMEOUT = 8.0
 UPDATE_USER_AGENT = f"CodecFoundry-Updater/{CODECFOUNDRY_VERSION}"
 FALLBACK_RELEASE_NOTES = "修复BUG"
 
@@ -3124,6 +3463,30 @@ def _fetch_update_json(url: str, timeout: float, accept_header: str | None = Non
     except Exception as exc:
         say(f"[更新] 读取更新信息失败：{url}（{exc}）")
         return None
+
+
+def _fetch_urls_race(
+    urls: Sequence[str], timeout: float, accept_header: str | None = None
+) -> dict[str, dict | None]:
+    """Fetch several URLs concurrently; unreachable ones are simply abandoned."""
+    results: dict[str, dict | None] = {}
+
+    def fetch_one(url: str) -> None:
+        accept = (
+            "application/vnd.github+json"
+            if "api.github.com" in url
+            else accept_header
+        )
+        results[url] = _fetch_update_json(url, timeout, accept)
+
+    threads = [
+        threading.Thread(target=fetch_one, args=(url,), daemon=True) for url in urls
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    return results
 
 
 def _normalize_download_pages(data: dict) -> list[str]:
@@ -3158,8 +3521,9 @@ def _is_newer_version(latest: object, current: object) -> bool:
 
 
 def _get_update_json_info() -> dict | None:
-    for update_url in UPDATE_INFO_URLS:
-        data = _fetch_update_json(update_url, UPDATE_HTTP_TIMEOUT)
+    results = _fetch_urls_race(UPDATE_INFO_URLS, UPDATE_HTTP_TIMEOUT)
+    for update_url in UPDATE_INFO_URLS:  # ordered: GitHub preferred
+        data = results.get(update_url)
         if not data:
             continue
         latest = str(data.get("latest", "")).strip()
@@ -3178,9 +3542,11 @@ def _get_update_json_info() -> dict | None:
 
 
 def _get_latest_release_info() -> dict | None:
-    for release_url in RELEASE_INFO_URLS:
-        accept = "application/vnd.github+json" if "api.github.com" in release_url else None
-        data = _fetch_update_json(release_url, UPDATE_RELEASE_TIMEOUT, accept_header=accept)
+    results = _fetch_urls_race(
+        RELEASE_INFO_URLS, UPDATE_RELEASE_TIMEOUT, accept_header="application/vnd.github+json"
+    )
+    for release_url in RELEASE_INFO_URLS:  # ordered: GitHub preferred
+        data = results.get(release_url)
         if not data:
             continue
         tag = str(data.get("tag_name") or "").strip().lstrip("vV")
@@ -3206,8 +3572,8 @@ def _get_latest_release_info() -> dict | None:
 def check_for_updates(current_version: str | None = None) -> dict | None:
     """Return update info when a newer version exists, else None.
 
-    update.json 是正常路径；不存在、请求失败、内容为空或解析失败时，回退到
-    GitHub（含 Gitee 镜像）最新 Release tag 检查。
+    update.json 是正常路径（GitHub 与 Gitee 并发请求，GitHub 优先）；不存在、
+    请求失败、内容为空或解析失败时，回退到最新 Release tag 检查。
     """
     global _update_sources_reachable
     _update_sources_reachable = False
@@ -3267,21 +3633,19 @@ def plan_task_assignment(
     settings: EncodeSettings,
     initial_loads: dict[int, float] | None = None,
 ) -> list[tuple[VideoTask, EncoderSlot]]:
-    """LPT assignment onto already-loaded slots; returns (task, slot) pairs."""
+    """Greedy assignment onto already-loaded slots; returns (task, slot) pairs.
+
+    Tasks keep their intake order so the waiting queue executes top-to-bottom;
+    each task goes to the least-loaded eligible slot.
+    """
     loads = {
         slot.slot_id: (float(initial_loads.get(slot.slot_id, 0.0)) if initial_loads else 0.0)
         for slot in slots
     }
     queued = {slot.slot_id: 0 for slot in slots}
-    weighted = sorted(
-        (
-            (scheduling_workload(task, settings), position, task)
-            for position, task in enumerate(tasks)
-        ),
-        key=lambda item: (-item[0], item[1]),
-    )
     pairs: list[tuple[VideoTask, EncoderSlot]] = []
-    for workload, _position, task in weighted:
+    for task in tasks:
+        workload = scheduling_workload(task, settings)
         chosen = min(
             slots,
             key=lambda slot: (
@@ -3694,6 +4058,8 @@ DEFAULT_PREFERENCES: dict[str, object] = {
     "log_max_entries": 8,
     "log_max_size_mb": 8,
     "check_update_on_startup": True,
+    "single_instance": True,
+    "drag_animation": True,
     "window_width": 1180,
     "window_height": 900,
     "window_maximized": False,
@@ -3941,7 +4307,6 @@ class DropInputList(QListWidget):
 SINGLE_INSTANCE_SERVER_NAME = (
     "CodecFoundry-" + hashlib.md5(str(APP_DATA_DIR).encode("utf-8")).hexdigest()[:12]
 )
-TASK_CARD_MIME = "application/x-codecfoundry-task"
 TASK_LONG_PRESS_MS = 380
 
 
@@ -4007,21 +4372,33 @@ def _cli_request_can_forward(argv: Sequence[str]) -> bool:
 
 
 class TaskCardFrame(QFrame):
-    """Queue card that starts a drag after a long press, reordering waiting tasks."""
+    """Queue card: a long press shrinks it 5% (animated) and starts a Y-only drag.
 
-    reorder_requested = Signal(str, object)  # dragged key, target key or None
+    While dragging, the card follows the cursor on the Y axis only; the host
+    window reflows the other cards live (auto-avoid) and inserts the card at the
+    release position.
+    """
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
-        self.setAcceptDrops(True)
         self._task_key: str | None = None
         self._draggable = False
         self._drag_active = False
+        self._host_window = None
+        self._scroll_area: QScrollArea | None = None
         self._press_global: QPoint | None = None
         self._press_timer = QTimer(self)
         self._press_timer.setSingleShot(True)
         self._press_timer.setInterval(TASK_LONG_PRESS_MS)
-        self._press_timer.timeout.connect(self._begin_drag)
+        self._press_timer.timeout.connect(self._begin_long_press)
+        self._scale_target = 1.0
+        self._scale_anim: QVariantAnimation | None = None
+        self._drag_original_size: QPoint | None = None
+        self._grab_offset_y = 0
+        self._autoscroll_delta = 0
+        self._autoscroll_timer = QTimer(self)
+        self._autoscroll_timer.setInterval(40)
+        self._autoscroll_timer.timeout.connect(self._auto_scroll)
 
     def set_task_key(self, task_key: str) -> None:
         self._task_key = task_key
@@ -4029,13 +4406,24 @@ class TaskCardFrame(QFrame):
     def set_draggable(self, draggable: bool) -> None:
         self._draggable = bool(draggable)
 
+    def set_host_window(self, window) -> None:
+        self._host_window = window
+
+    def set_scroll_area(self, scroll_area: QScrollArea) -> None:
+        self._scroll_area = scroll_area
+
+    # -- long press -------------------------------------------------------
+
     def mousePressEvent(self, event) -> None:
-        if event.button() == Qt.MouseButton.LeftButton and self._draggable:
+        if event.button() == Qt.MouseButton.LeftButton and self._draggable and not self._drag_active:
             self._press_global = event.globalPosition().toPoint()
             self._press_timer.start()
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:
+        if self._drag_active:
+            self._drag_move(event)
+            return
         if self._press_timer.isActive() and self._press_global is not None:
             distance = (
                 event.globalPosition().toPoint() - self._press_global
@@ -4045,59 +4433,122 @@ class TaskCardFrame(QFrame):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:
+        if self._drag_active:
+            self._end_drag()
+            return
         self._press_timer.stop()
         super().mouseReleaseEvent(event)
 
-    def _begin_drag(self) -> None:
-        if not self._draggable or self._task_key is None or self._drag_active:
+    def _begin_long_press(self) -> None:
+        if (
+            not self._draggable
+            or self._drag_active
+            or self._task_key is None
+            or self._host_window is None
+        ):
+            return
+        if not self._host_window.begin_card_drag(self._task_key):
             return
         self._drag_active = True
-        drag = QDrag(self)
-        mime = QMimeData()
-        mime.setData(TASK_CARD_MIME, QByteArray(self._task_key.encode("utf-8")))
-        drag.setMimeData(mime)
-        drag.exec(Qt.DropAction.MoveAction)
+        self._press_timer.stop()
+        frame_top = self.mapToGlobal(QPoint(0, 0)).y()
+        self._grab_offset_y = (
+            self._press_global.y() - frame_top if self._press_global is not None else 0
+        )
+        self._press_global = None
+        self._drag_original_size = self.size()
+        self.grabMouse()
+        self.raise_()
+        self._set_scale(0.95, animated=True)
+        self._autoscroll_timer.start()
+        self._host_window.on_card_drag_started(self._task_key)
+
+    # -- manual Y-only drag ------------------------------------------------
+
+    def _drag_move(self, event) -> None:
+        global_position = event.globalPosition().toPoint()
+        parent = self.parentWidget()
+        if parent is None:
+            return
+        parent_top = parent.mapToGlobal(QPoint(0, 0)).y()
+        new_y = global_position.y() - self._grab_offset_y - parent_top
+        new_y = max(0, min(new_y, max(0, parent.height() - self.height())))
+        self.move(self.x(), new_y)  # X stays fixed: Y-axis movement only
+        self._check_autoscroll(global_position.y())
+        self._host_window.on_card_drag_moved(self._task_key, global_position.y())
+
+    def _check_autoscroll(self, global_y: int) -> None:
+        if self._scroll_area is None:
+            self._autoscroll_delta = 0
+            return
+        viewport = self._scroll_area.viewport()
+        top = viewport.mapToGlobal(QPoint(0, 0)).y()
+        bottom = top + viewport.height()
+        if global_y < top + 28:
+            self._autoscroll_delta = -10
+        elif global_y > bottom - 28:
+            self._autoscroll_delta = 10
+        else:
+            self._autoscroll_delta = 0
+
+    def _auto_scroll(self) -> None:
+        if self._autoscroll_delta == 0 or self._scroll_area is None:
+            return
+        scrollbar = self._scroll_area.verticalScrollBar()
+        scrollbar.setValue(scrollbar.value() + self._autoscroll_delta)
+
+    def _end_drag(self) -> None:
+        if not self._drag_active:
+            return
         self._drag_active = False
+        self._autoscroll_timer.stop()
+        self._autoscroll_delta = 0
+        self.releaseMouse()
+        self._set_scale(1.0, animated=True)
+        self._release_fixed_size()
+        if self._host_window is not None and self._task_key is not None:
+            self._host_window.on_card_drag_finished(self._task_key)
 
-    def dragEnterEvent(self, event) -> None:
-        if event.mimeData().hasFormat(TASK_CARD_MIME) and self._draggable:
-            event.acceptProposedAction()
-            return
-        event.ignore()
+    # -- 5% shrink animation (can be disabled in settings) -----------------
 
-    def dropEvent(self, event) -> None:
-        raw = bytes(event.mimeData().data(TASK_CARD_MIME))
-        dragged_key = raw.decode("utf-8", errors="replace")
-        if dragged_key and dragged_key != self._task_key:
-            self.reorder_requested.emit(dragged_key, self._task_key)
-            event.acceptProposedAction()
+    def _release_fixed_size(self) -> None:
+        self.setMinimumSize(0, 0)
+        self.setMaximumSize(_QWIDGETSIZE_MAX, _QWIDGETSIZE_MAX)
+
+    def _set_scale(self, scale: float, animated: bool) -> None:
+        enabled = (
+            animated
+            and self._host_window is not None
+            and getattr(self._host_window, "drag_animation_enabled", True)
+        )
+        if enabled:
+            if self._scale_anim is None:
+                self._scale_anim = QVariantAnimation(self, duration=120)
+                self._scale_anim.valueChanged.connect(self._apply_scale)
+            self._scale_anim.stop()
+            self._scale_anim.setStartValue(self._scale_target)
+            self._scale_anim.setEndValue(scale)
+            self._scale_target = scale
+            self._scale_anim.start()
+        else:
+            self._scale_target = scale
+            self._apply_scale(scale)
+
+    def _apply_scale(self, value) -> None:
+        if self._drag_original_size is None:
             return
-        event.ignore()
+        factor = float(value)
+        self.setFixedSize(
+            max(1, round(self._drag_original_size.x() * factor)),
+            max(1, round(self._drag_original_size.y() * factor)),
+        )
 
 
 class TaskHostWidget(QWidget):
-    """Sidebar container accepting drops at the end of the waiting queue."""
-
-    reorder_requested = Signal(str, object)
+    """Sidebar container for queue cards."""
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
-        self.setAcceptDrops(True)
-
-    def dragEnterEvent(self, event) -> None:
-        if event.mimeData().hasFormat(TASK_CARD_MIME):
-            event.acceptProposedAction()
-            return
-        event.ignore()
-
-    def dropEvent(self, event) -> None:
-        raw = bytes(event.mimeData().data(TASK_CARD_MIME))
-        dragged_key = raw.decode("utf-8", errors="replace")
-        if dragged_key:
-            self.reorder_requested.emit(dragged_key, None)
-            event.acceptProposedAction()
-            return
-        event.ignore()
 
 
 class TitleBar(QWidget):
@@ -4288,8 +4739,14 @@ class SettingsDialog(QDialog):
         self.debug_check.setChecked(host.debug_progress_enabled)
         self.update_check = QCheckBox("启动时自动检查更新")
         self.update_check.setChecked(host.check_update_on_startup)
+        self.single_instance_check = QCheckBox("单实例运行（新启动转发到本窗口）")
+        self.single_instance_check.setChecked(host.single_instance_enabled)
+        self.drag_animation_check = QCheckBox("任务卡拖拽动效（长按缩小）")
+        self.drag_animation_check.setChecked(host.drag_animation_enabled)
         general_layout.addWidget(self.debug_check)
         general_layout.addWidget(self.update_check)
+        general_layout.addWidget(self.single_instance_check)
+        general_layout.addWidget(self.drag_animation_check)
         layout.addWidget(general_panel)
 
         log_panel = QFrame()
@@ -4353,6 +4810,8 @@ class SettingsDialog(QDialog):
     def _restore_defaults(self) -> None:
         self.debug_check.setChecked(bool(DEFAULT_PREFERENCES["debug_progress"]))
         self.update_check.setChecked(bool(DEFAULT_PREFERENCES["check_update_on_startup"]))
+        self.single_instance_check.setChecked(bool(DEFAULT_PREFERENCES["single_instance"]))
+        self.drag_animation_check.setChecked(bool(DEFAULT_PREFERENCES["drag_animation"]))
         self.logging_check.setChecked(bool(DEFAULT_PREFERENCES["logging_enabled"]))
         self.max_entries_spin.setValue(int(DEFAULT_PREFERENCES["log_max_entries"]))
         self.max_size_spin.setValue(int(DEFAULT_PREFERENCES["log_max_size_mb"]))
@@ -4438,6 +4897,194 @@ class UpdateDialog(QDialog):
             actions.addWidget(fallback)
 
 
+class _FfmpegSetupBridge(QObject):
+    progress = Signal(object)
+    done = Signal(object)
+
+
+class FfmpegSetupWindow(QDialog):
+    """Startup FFmpeg provisioning window: progress, speed, ETA and fallback UI.
+
+    It appears while the main window stays unstarted, so the very first thing a
+    user sees during an install/update is this dedicated window rather than a
+    bare message box.
+    """
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setWindowTitle(f"{APP_NAME} · FFmpeg 初始化")
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        self.setMinimumWidth(520)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        self.bridge = _FfmpegSetupBridge(self)
+        self.bridge.progress.connect(self._on_progress)
+        self.bridge.done.connect(self._on_done)
+        self._install_done = False
+        self._failed = False
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(12)
+        self.title_label = QLabel("正在准备 FFmpeg …")
+        self.title_label.setObjectName("sectionTitle")
+        layout.addWidget(self.title_label)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setObjectName("orangeProgress")
+        self.progress_bar.setRange(0, 1000)
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setFormat("%p%")
+        layout.addWidget(self.progress_bar)
+
+        self.stage_label = QLabel("正在检查本地 FFmpeg 版本（需要 >= 5.1）…")
+        self.stage_label.setWordWrap(True)
+        self.stage_label.setStyleSheet("color: #d0d0d0;")
+        layout.addWidget(self.stage_label)
+        self.detail_label = QLabel("")
+        self.detail_label.setWordWrap(True)
+        self.detail_label.setObjectName("hint")
+        layout.addWidget(self.detail_label)
+
+        self.manual_frame = QFrame()
+        self.manual_frame.setObjectName("panel")
+        manual_layout = QVBoxLayout(self.manual_frame)
+        manual_layout.setContentsMargins(14, 12, 14, 12)
+        manual_title = QLabel("自动下载失败，请手动下载 FFmpeg（>= 5.1）：")
+        manual_title.setWordWrap(True)
+        manual_hint = QLabel(
+            "下载后把 ffmpeg.exe / ffprobe.exe 放入上面的应用目录，再重新启动本程序。"
+        )
+        manual_hint.setObjectName("hint")
+        manual_hint.setWordWrap(True)
+        buttons_row = QHBoxLayout()
+        github_button = QPushButton("GitHub 源")
+        github_button.setObjectName("primaryButton")
+        github_button.clicked.connect(
+            lambda _checked=False: QDesktopServices.openUrl(QUrl(FFMPEG_GITHUB_PAGE))
+        )
+        gitee_button = QPushButton("中国境内源（Gitee）")
+        gitee_button.setObjectName("primaryButton")
+        gitee_button.clicked.connect(
+            lambda _checked=False: QDesktopServices.openUrl(QUrl(FFMPEG_GITEE_PAGE))
+        )
+        buttons_row.addWidget(github_button)
+        buttons_row.addWidget(gitee_button)
+        buttons_row.addStretch(1)
+        manual_layout.addWidget(manual_title)
+        manual_layout.addWidget(manual_hint)
+        manual_layout.addLayout(buttons_row)
+        self.manual_frame.hide()
+        layout.addWidget(self.manual_frame)
+
+        self.close_button = QPushButton("关闭")
+        self.close_button.setObjectName("primaryButton")
+        self.close_button.setMinimumWidth(140)
+        self.close_button.clicked.connect(self.reject)
+        self.close_button.hide()
+        layout.addWidget(self.close_button, 0, Qt.AlignmentFlag.AlignRight)
+
+    def report_progress(self, payload: dict) -> None:
+        self.bridge.progress.emit(dict(payload))
+
+    def report_done(self, payload: dict) -> None:
+        self.bridge.done.emit(dict(payload))
+
+    def _on_progress(self, raw: object) -> None:
+        payload = dict(raw) if isinstance(raw, dict) else {}
+        stage = str(payload.get("stage") or "")
+        name = str(payload.get("name") or "")
+        detail = str(payload.get("detail") or "")
+        if stage == "download":
+            done = int(payload.get("done") or 0)
+            total = int(payload.get("total") or 0)
+            speed = float(payload.get("speed") or 0)
+            eta = payload.get("eta")
+            self.title_label.setText(f"正在下载 FFmpeg · {name}")
+            if total > 0:
+                self.progress_bar.setRange(0, 1000)
+                self.progress_bar.setValue(round(done / total * 1000))
+                self.progress_bar.setFormat(
+                    f"{done / total * 100:.0f}% · "
+                    f"{format_file_size(done)} / {format_file_size(total)}"
+                )
+            else:
+                self.progress_bar.setRange(0, 0)
+                self.progress_bar.setFormat(f"已下载 {format_file_size(done)}")
+            speed_text = (
+                f"{format_file_size(speed)}/s" if speed > 0 else "--"
+            )
+            eta_text = (
+                f"预计剩余 {int(eta)} 秒" if isinstance(eta, (int, float)) and eta >= 0 else ""
+            )
+            self.detail_label.setText(f"速度：{speed_text} · {eta_text}")
+        elif stage == "extract":
+            self.title_label.setText(f"正在解压 {name} …")
+            self.stage_label.setText(detail or "正在解压压缩包")
+            self.progress_bar.setRange(0, 0)
+            self.progress_bar.setFormat("解压中")
+        else:
+            self.title_label.setText(detail or "正在准备 FFmpeg …")
+            self.stage_label.setText(detail or "")
+
+    def _on_done(self, raw: object) -> None:
+        payload = dict(raw) if isinstance(raw, dict) else {}
+        self._install_done = bool(payload.get("installed"))
+        if payload.get("error"):
+            self._failed = True
+            self.title_label.setText("FFmpeg 初始化失败")
+            self.progress_bar.setRange(0, 1000)
+            self.progress_bar.setValue(0)
+            self.progress_bar.setFormat("失败")
+            self.stage_label.setText(str(payload.get("error")))
+            self.detail_label.setText(
+                f"安装目录：{payload.get('install_dir', FFMPEG_INSTALL_DIR)}"
+            )
+            self.manual_frame.show()
+            self.close_button.show()
+
+
+def load_app_preferences() -> dict[str, object]:
+    """Read and sanitize preferences; usable before any window exists."""
+    preferences = dict(DEFAULT_PREFERENCES)
+    try:
+        loaded = json.loads(APP_SETTINGS_PATH.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            for key in preferences:
+                if key in loaded:
+                    preferences[key] = loaded[key]
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        pass
+
+    def limited_int(key: str, default: int, minimum: int, maximum: int) -> int:
+        try:
+            value = int(preferences.get(key) or default)
+        except (TypeError, ValueError):
+            value = default
+        return max(minimum, min(maximum, value))
+
+    preferences["log_max_entries"] = limited_int(
+        "log_max_entries", 8, 1, 100
+    )
+    preferences["log_max_size_mb"] = limited_int(
+        "log_max_size_mb", 8, 1, 1024
+    )
+    preferences["window_width"] = limited_int(
+        "window_width", 1180, 900, 7680
+    )
+    preferences["window_height"] = limited_int(
+        "window_height", 900, 680, 4320
+    )
+    return preferences
+
+
+def single_instance_preferred() -> bool:
+    """Whether the single-instance IPC is enabled in the saved preferences."""
+    try:
+        return bool(load_app_preferences().get("single_instance", True))
+    except Exception:
+        return True
+
+
 class CodecFoundryWindow(QMainWindow):
     def __init__(self, ipc_server: QLocalServer | None = None) -> None:
         super().__init__()
@@ -4447,6 +5094,8 @@ class CodecFoundryWindow(QMainWindow):
         self.log_max_entries = int(self.preferences["log_max_entries"])
         self.log_max_size_mb = int(self.preferences["log_max_size_mb"])
         self.check_update_on_startup = bool(self.preferences["check_update_on_startup"])
+        self.single_instance_enabled = bool(self.preferences["single_instance"])
+        self.drag_animation_enabled = bool(self.preferences["drag_animation"])
         try:
             APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
             APP_LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -4508,6 +5157,8 @@ class CodecFoundryWindow(QMainWindow):
         self.restart_keys: set[str] = set()
         self.batch_cancelled_count = 0
         self._update_check_running = False
+        self._active_drag_key: str | None = None
+        self._drag_index = 0
 
         self._build_ui()
         self._apply_preferences()
@@ -4525,36 +5176,7 @@ class CodecFoundryWindow(QMainWindow):
 
     @staticmethod
     def _load_preferences() -> dict[str, object]:
-        preferences = dict(DEFAULT_PREFERENCES)
-        try:
-            loaded = json.loads(APP_SETTINGS_PATH.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                for key in preferences:
-                    if key in loaded:
-                        preferences[key] = loaded[key]
-        except (OSError, json.JSONDecodeError, UnicodeError):
-            pass
-
-        def limited_int(key: str, default: int, minimum: int, maximum: int) -> int:
-            try:
-                value = int(preferences.get(key) or default)
-            except (TypeError, ValueError):
-                value = default
-            return max(minimum, min(maximum, value))
-
-        preferences["log_max_entries"] = limited_int(
-            "log_max_entries", 8, 1, 100
-        )
-        preferences["log_max_size_mb"] = limited_int(
-            "log_max_size_mb", 8, 1, 1024
-        )
-        preferences["window_width"] = limited_int(
-            "window_width", 1180, 900, 7680
-        )
-        preferences["window_height"] = limited_int(
-            "window_height", 900, 680, 4320
-        )
-        return preferences
+        return load_app_preferences()
 
     def _build_ui(self) -> None:
         surface = QWidget()
@@ -4686,6 +5308,8 @@ class CodecFoundryWindow(QMainWindow):
             "log_max_entries": self.log_max_entries,
             "log_max_size_mb": self.log_max_size_mb,
             "check_update_on_startup": self.check_update_on_startup,
+            "single_instance": self.single_instance_enabled,
+            "drag_animation": self.drag_animation_enabled,
             "window_width": max(900, normal_size.width()),
             "window_height": max(680, normal_size.height()),
             "window_maximized": self.isMaximized(),
@@ -4927,9 +5551,9 @@ class CodecFoundryWindow(QMainWindow):
         layout.addWidget(title)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
+        self.task_scroll = scroll
         self.task_host = TaskHostWidget()
         self.task_host.setObjectName("contentHost")
-        self.task_host.reorder_requested.connect(self._handle_card_reorder)
         self.task_layout = QVBoxLayout(self.task_host)
         self.task_layout.setContentsMargins(0, 0, 0, 0)
         self.task_layout.setSpacing(6)
@@ -5145,6 +5769,8 @@ class CodecFoundryWindow(QMainWindow):
         previous_debug = self.debug_progress_enabled
         self.debug_progress_enabled = dialog.debug_check.isChecked()
         self.check_update_on_startup = dialog.update_check.isChecked()
+        self.single_instance_enabled = dialog.single_instance_check.isChecked()
+        self.drag_animation_enabled = dialog.drag_animation_check.isChecked()
         self.logging_enabled = dialog.logging_check.isChecked()
         self.log_max_entries = dialog.max_entries_spin.value()
         self.log_max_size_mb = dialog.max_size_spin.value()
@@ -5517,18 +6143,78 @@ class CodecFoundryWindow(QMainWindow):
         self.task_records.clear()
         self.waiting_order.clear()
 
-    def _rebuild_task_sidebar(self) -> None:
+    def _rebuild_task_sidebar(self, exclude_key: str | None = None) -> None:
         """Lay cards out: waiting tasks first in queue order, then the rest."""
         if not hasattr(self, "task_layout"):
             return
-        waiting_keys = [key for key in self.waiting_order if key in self.task_widgets]
+        waiting_keys = [
+            key
+            for key in self.waiting_order
+            if key in self.task_widgets and key != exclude_key
+        ]
         waiting_set = set(waiting_keys)
-        other_keys = [key for key in self.task_records if key not in waiting_set]
+        other_keys = [
+            key
+            for key in self.task_records
+            if key not in waiting_set and key != exclude_key
+        ]
         while self.task_layout.count():
             self.task_layout.takeAt(0)
         for key in reversed(waiting_keys + other_keys):
             self.task_layout.insertWidget(0, self.task_widgets[key]["frame"])
         self.task_layout.addStretch(1)
+
+    # -- manual long-press drag coordination --------------------------------
+
+    def begin_card_drag(self, task_key: str) -> bool:
+        """Remove the pressed card from the layout so others can reflow."""
+        if self._active_drag_key is not None:
+            return False
+        record = self.task_records.get(task_key)
+        if not record or str(record.get("status") or "") != "waiting":
+            return False
+        self._active_drag_key = task_key
+        self._drag_index = (
+            self.waiting_order.index(task_key)
+            if task_key in self.waiting_order
+            else 0
+        )
+        widgets = self.task_widgets.get(task_key)
+        if widgets:
+            self.task_layout.removeWidget(widgets["frame"])
+        return True
+
+    def on_card_drag_started(self, task_key: str) -> None:
+        self._rebuild_task_sidebar(exclude_key=task_key)
+
+    def on_card_drag_moved(self, task_key: str, global_y: int) -> None:
+        """Live-reorder around the dragged card (auto-avoid for the others)."""
+        index = 0
+        for key in self.waiting_order:
+            if key == task_key:
+                continue
+            widgets = self.task_widgets.get(key)
+            if widgets is None:
+                continue
+            frame = widgets["frame"]
+            center_y = frame.mapToGlobal(frame.rect().center()).y()
+            if global_y > center_y:
+                index += 1
+        if index != self._drag_index:
+            self._drag_index = index
+            if task_key in self.waiting_order:
+                self.waiting_order.remove(task_key)
+            self.waiting_order.insert(min(index, len(self.waiting_order)), task_key)
+            self._rebuild_task_sidebar(exclude_key=task_key)
+
+    def on_card_drag_finished(self, task_key: str) -> None:
+        """Insert the card at its release position and commit the new order."""
+        self._active_drag_key = None
+        self._drag_index = 0
+        self._rebuild_task_sidebar()
+        if self.scheduler is not None:
+            self.scheduler.reorder_waiting(list(self.waiting_order))
+        self._set_status("等待队列顺序已更新，将按新顺序调度")
 
     def _handle_card_reorder(self, dragged_key: str, target_key: object) -> None:
         keys = list(self.waiting_order)
@@ -5568,7 +6254,9 @@ class CodecFoundryWindow(QMainWindow):
         frame = TaskCardFrame()
         frame.setObjectName("panel")
         frame.set_task_key(task_key)
-        frame.reorder_requested.connect(self._handle_card_reorder)
+        frame.set_host_window(self)
+        if hasattr(self, "task_scroll"):
+            frame.set_scroll_area(self.task_scroll)
         layout = QVBoxLayout(frame)
         layout.setContentsMargins(9, 7, 9, 7)
         layout.setSpacing(2)
@@ -5713,7 +6401,7 @@ class CodecFoundryWindow(QMainWindow):
             widgets["frame"].set_draggable(status == "waiting")
         if was_waiting and status != "waiting" and task_key in self.waiting_order:
             self.waiting_order.remove(task_key)
-            self._rebuild_task_sidebar()
+            self._rebuild_task_sidebar(exclude_key=self._active_drag_key)
 
     def _handle_task_action(self, task_key: str) -> None:
         record = self.task_records.get(task_key)
@@ -5821,7 +6509,8 @@ class CodecFoundryWindow(QMainWindow):
                 self._set_status(detail or "正在准备 FFmpeg……")
             return
         if event_type == "ffmpeg_failed":
-            page = str(payload.get("page") or "")
+            github_page = str(payload.get("github_page") or FFMPEG_GITHUB_PAGE)
+            gitee_page = str(payload.get("gitee_page") or FFMPEG_GITEE_PAGE)
             detail = str(payload.get("detail") or "缺少可用 FFmpeg")
             install_dir = str(payload.get("install_dir") or "")
             box = QMessageBox(self)
@@ -5831,13 +6520,16 @@ class CodecFoundryWindow(QMainWindow):
             box.setInformativeText(
                 "FFmpeg >= 5.1 才能使用 -fps_mode。\n"
                 f"安装目录：{install_dir}\n"
-                "可打开下载页手动取得 ffmpeg.exe / ffprobe.exe 放入该目录。"
+                "可手动下载 ffmpeg.exe / ffprobe.exe 放入该目录。"
             )
-            open_button = box.addButton("打开下载页", QMessageBox.ButtonRole.AcceptRole)
+            github_button = box.addButton("GitHub 源", QMessageBox.ButtonRole.AcceptRole)
+            gitee_button = box.addButton("中国境内源（Gitee）", QMessageBox.ButtonRole.ActionRole)
             box.addButton("关闭", QMessageBox.ButtonRole.RejectRole)
             box.exec()
-            if box.clickedButton() is open_button and page:
-                QDesktopServices.openUrl(QUrl(page))
+            if box.clickedButton() is github_button:
+                QDesktopServices.openUrl(QUrl(github_page))
+            elif box.clickedButton() is gitee_button:
+                QDesktopServices.openUrl(QUrl(gitee_page))
             return
         if event_type == "slots_changed":
             slots = list(payload.get("slots", []))
@@ -6226,10 +6918,12 @@ class CodecFoundryWindow(QMainWindow):
             "  3. 已有输出和新编码输出均执行 GPU / NVDEC 全量校验\n"
             "  4. 提供 CQ-VBR、实时进度、任务队列和安全退出保护\n"
             "  5. 支持直接拖入视频文件或文件夹\n"
-            "  6. 单实例运行：FlashCut 重复联动会合并进现有编码队列\n"
-            "  7. 等待任务支持长按拖拽排序，直接影响后续调度\n"
-            "  8. 内置 FFmpeg 版本检测与自动安装（应用目录，不动系统 PATH）\n"
-            "  9. 启动自动检查更新（update.json / GitHub Releases）"
+            "  6. 单实例运行（可在设置关闭）：FlashCut 重复联动合并进现有编码队列\n"
+            "  7. 等待任务长按缩小 5% 动效拖拽排序（可关动效），队列自上而下执行\n"
+            "  8. 启动期 FFmpeg 专用进度窗口：速度 / 剩余时间，可一键全局安装（UAC）\n"
+            "  9. FFmpeg 自动检测与安装：复用 FlashCut / DJI DPVC，GitHub 与 Gitee\n"
+            "     并发下载取最快，gyan.dev 兜底，支持 .7z 自动解析\n"
+            " 10. 启动自动检查更新（update.json 并发竞速、GitHub 优先 / Releases 回退）"
         )
         changes.setWordWrap(True)
         changes.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
@@ -6309,19 +7003,22 @@ class CodecFoundryWindow(QMainWindow):
         info = data.get("info")
         reachable = bool(data.get("reachable", True))
         if isinstance(info, dict):
+            latest = str(info.get("latest") or "")
+            self._set_status(f"发现新版本 {latest}，可在更新窗口中查看")
             dialog = UpdateDialog(self, info)
             dialog.exec()
-        elif mode == "manual":
-            if reachable:
+        elif reachable:
+            self._set_status(f"已是最新版本 {APP_VERSION}")
+            if mode == "manual":
                 QMessageBox.information(self, APP_TITLE, "当前已是最新版本。")
-            else:
+        else:
+            self._set_status("无法连接更新服务器，请检查网络后重试")
+            if mode == "manual":
                 QMessageBox.warning(
                     self,
                     APP_TITLE,
                     "无法连接更新服务器，请检查网络后重试。",
                 )
-        elif reachable:
-            self._set_status(f"已是最新版本 {APP_VERSION}")
 
     # -- single-instance IPC ----------------------------------------------
 
@@ -6529,6 +7226,93 @@ class CodecFoundryWindow(QMainWindow):
             application.quit()
 
 
+def run_ffmpeg_startup_phase() -> bool:
+    """Provision FFmpeg before the main window exists; False on failure.
+
+    The dedicated FfmpegSetupWindow shows progress, speed and ETA while the
+    main interface stays unstarted.
+    """
+    setup = FfmpegSetupWindow()
+    outcome: dict[str, object] = {}
+    finished = threading.Event()
+
+    def progress_callback(stage, name, done, total, speed, eta) -> None:
+        try:
+            setup.report_progress(
+                {
+                    "stage": stage,
+                    "name": name,
+                    "done": done,
+                    "total": total,
+                    "speed": speed,
+                    "eta": eta,
+                }
+            )
+        except RuntimeError:
+            pass
+
+    def worker() -> None:
+        try:
+            ffmpeg_path, ffprobe_path = ensure_ffmpeg_runtime(
+                progress_callback=progress_callback
+            )
+            outcome["ffmpeg"] = str(ffmpeg_path)
+            outcome["ffprobe"] = str(ffprobe_path)
+            outcome["installed"] = ffmpeg_installed_this_run()
+        except TranscodeError as exc:
+            outcome["error"] = str(exc)
+        finished.set()
+
+    threading.Thread(
+        target=worker, daemon=True, name="CodecFoundryFfmpegSetup"
+    ).start()
+
+    show_timer = QTimer()
+    show_timer.setSingleShot(True)
+    show_timer.setInterval(250)
+    show_timer.timeout.connect(
+        lambda: setup.show() if not finished.is_set() else None
+    )
+    show_timer.start()
+
+    application = QApplication.instance()
+    while not finished.is_set():
+        if application is not None:
+            application.processEvents()
+        time.sleep(0.02)
+    if application is not None:
+        application.processEvents()
+    show_timer.stop()
+    setup._on_done(outcome)
+    if outcome.get("error"):
+        setup.show()
+        setup.raise_()
+        setup.activateWindow()
+        setup.exec()
+        return False
+    if outcome.get("installed"):
+        box = QMessageBox()
+        box.setWindowTitle(f"{APP_NAME} · FFmpeg 安装完成")
+        box.setText("FFmpeg 已安装到应用目录。")
+        box.setInformativeText(
+            "是否同时安装到 C:\\Windows 使系统全局可用？\n"
+            "选择“全局安装”会弹出 UAC 管理员授权。"
+        )
+        yes = box.addButton("全局安装（UAC）", QMessageBox.ButtonRole.YesRole)
+        no = box.addButton("仅应用目录", QMessageBox.ButtonRole.NoRole)
+        box.setDefaultButton(no)
+        box.exec()
+        if box.clickedButton() is yes:
+            success = copy_ffmpeg_to_system(FFMPEG_INSTALL_DIR)
+            QMessageBox.information(
+                None,
+                APP_TITLE,
+                "已全局安装到 C:\\Windows。" if success else "全局安装失败或已被取消；应用目录版本仍可使用。",
+            )
+    setup.close()
+    return True
+
+
 def gui_main(argv: Sequence[str] | None = None) -> int:
     gui_arguments = list(argv) if argv is not None else sys.argv[1:]
     gui_parser = argparse.ArgumentParser(add_help=False)
@@ -6561,14 +7345,21 @@ def gui_main(argv: Sequence[str] | None = None) -> int:
     palette.setColor(QPalette.ColorRole.Highlight, QColor(COLOR_BLUE))
     app.setPalette(palette)
     app.setStyleSheet(APP_STYLESHEET)
-    ipc_server, forwarded = acquire_single_instance(gui_arguments)
+    use_ipc = single_instance_preferred()
+    ipc_server: QLocalServer | None = None
+    forwarded = False
+    if use_ipc:
+        ipc_server, forwarded = acquire_single_instance(gui_arguments)
     if forwarded:
         # The request was handed to the running instance; do not open a second window.
         return 0
+    # FFmpeg version check/install runs at startup, before the main window.
+    if not run_ffmpeg_startup_phase():
+        return 1
     window = CodecFoundryWindow(ipc_server=ipc_server)
     window.startup_argv = list(gui_arguments)
     window.show()
-    if ipc_server is None:
+    if ipc_server is None and use_ipc:
         # Lost the claim race: retry once the event loop is running.
         QTimer.singleShot(600, window.retry_ipc_claim)
     if gui_options.hlm:
@@ -6585,7 +7376,7 @@ if __name__ == "__main__":
         cli_args = [argument for argument in sys.argv[1:] if argument != "--cli"]
         if "--version" in cli_args:
             raise SystemExit(main(cli_args))
-        if _cli_request_can_forward(cli_args):
+        if single_instance_preferred() and _cli_request_can_forward(cli_args):
             app = QApplication.instance() or QApplication(["CodecFoundry-forward"])
             if _forward_to_running_instance(cli_args):
                 raise SystemExit(0)

@@ -73,6 +73,30 @@ class FfmpegVersionTests(unittest.TestCase):
         with mock.patch.object(cf, "run_captured_text", return_value=completed):
             self.assertTrue(cf.ffmpeg_version_ok("ffmpeg"))
 
+    def test_gyan_full_build_version_parses(self):
+        completed = cf.subprocess.CompletedProcess(
+            ["ffmpeg"], 0, "ffmpeg version 9.0.1-full_build-www.gyan.dev Copyright (c) 2000-2026\n", ""
+        )
+        with mock.patch.object(cf, "run_captured_text", return_value=completed):
+            self.assertEqual(cf._tool_version_tuple("ffmpeg"), (9, 0, 1, 0))
+            self.assertTrue(cf.ffmpeg_version_ok("ffmpeg"))
+
+    def test_git_build_without_dotted_version_is_judged_by_date(self):
+        modern_git = cf.subprocess.CompletedProcess(
+            ["ffmpeg"], 0,
+            "ffmpeg version git-2026-02-09-9bfa1635ae-essentials_build-www.gyan.dev "
+            "Copyright (c) 2000-2026\n",
+            "",
+        )
+        with mock.patch.object(cf, "run_captured_text", return_value=modern_git):
+            self.assertEqual(cf._tool_version_tuple("ffmpeg"), (2026, 2, 9, 0))
+            self.assertTrue(cf.ffmpeg_version_ok("ffmpeg"))
+        ancient_git = cf.subprocess.CompletedProcess(
+            ["ffmpeg"], 0, "ffmpeg version git-2019-01-01-abcdef1\n", ""
+        )
+        with mock.patch.object(cf, "run_captured_text", return_value=ancient_git):
+            self.assertFalse(cf.ffmpeg_version_ok("ffmpeg"))
+
     def test_broken_or_missing_executable_is_rejected(self):
         with mock.patch.object(cf, "run_captured_text", side_effect=OSError("missing")):
             self.assertIsNone(cf._tool_version_tuple("ffmpeg"))
@@ -100,14 +124,72 @@ class FfmpegVersionTests(unittest.TestCase):
         self.assertEqual(Path(ffprobe), install_dir / "ffprobe.exe")
         cf._ffmpeg_runtime_cache = None
 
+    def test_external_ffmpeg_from_appdata_apps_is_preferred_over_path(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            appdata = Path(temp_dir) / "Roaming"
+            flashcut = appdata / "FlashCut" / "ffmpeg"
+            flashcut.mkdir(parents=True)
+            flashcut_ff = flashcut / "ffmpeg.exe"
+            flashcut_fp = flashcut / "ffprobe.exe"
+            flashcut_ff.write_bytes(b"x")
+            flashcut_fp.write_bytes(b"x")
+            with mock.patch.dict(
+                cf.os.environ, {"APPDATA": str(appdata)}
+            ), mock.patch.object(cf, "ffmpeg_version_ok", return_value=True):
+                found = cf._find_external_ffmpeg()
+            self.assertIsNotNone(found)
+            assert found is not None
+            self.assertEqual(found[0].parent, flashcut)
+            self.assertEqual(found[1].parent, flashcut)
+
     def test_ensure_ffmpeg_runtime_raises_when_nothing_works(self):
         cf._ffmpeg_runtime_cache = None
         with mock.patch.object(cf, "ffmpeg_version_ok", return_value=False), \
              mock.patch.object(cf, "_install_ffmpeg_binaries", return_value=False), \
-             mock.patch.object(cf.shutil, "which", return_value=None):
+             mock.patch.object(cf, "_find_external_ffmpeg", return_value=None):
             with self.assertRaises(cf.TranscodeError):
                 cf.ensure_ffmpeg_runtime()
         cf._ffmpeg_runtime_cache = None
+
+    def test_github_ffmpeg_assets_prefer_full_build(self):
+        payload = {
+            "tag_name": "9.0.1",
+            "assets": [
+                {"name": "ffmpeg-9.0.1-essentials_build.7z",
+                 "browser_download_url": "https://github.example/essentials.7z"},
+                {"name": "ffmpeg-9.0.1-full_build.7z",
+                 "browser_download_url": "https://github.example/full.7z"},
+            ],
+        }
+        with mock.patch.object(cf, "_fetch_update_json", return_value=dict(payload)):
+            assets = cf._parse_github_ffmpeg_assets()
+        self.assertEqual(assets, [("ffmpeg-9.0.1-full_build.7z",
+                                   "https://github.example/full.7z")])
+
+    def test_gitee_ffmpeg_assets_listed(self):
+        payload = {
+            "assets": [
+                {"name": "ffmpeg.zip", "browser_download_url": "https://gitee.example/ffmpeg.zip"},
+                {"name": "ffprobe.zip", "browser_download_url": "https://gitee.example/ffprobe.zip"},
+                {"name": "notes.txt", "browser_download_url": "https://gitee.example/notes.txt"},
+            ],
+        }
+        with mock.patch.object(cf, "_fetch_update_json", return_value=dict(payload)):
+            assets = cf._parse_gitee_ffmpeg_assets()
+        self.assertEqual(len(assets), 2)
+        self.assertTrue(all(name.endswith(".zip") for name, _ in assets))
+
+    def test_stale_part_files_are_cleaned_before_install(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            install_dir = Path(temp_dir)
+            (install_dir / "ffmpeg.zip.part").write_bytes(b"junk")
+            (install_dir / "ffprobe.7z.part").write_bytes(b"junk")
+            leftover = install_dir / ".dl-github"
+            leftover.mkdir()
+            (leftover / "old.zip").write_bytes(b"junk")
+            cf._cleanup_stale_downloads(install_dir)
+            self.assertEqual(list(install_dir.glob("*.part")), [])
+            self.assertFalse(leftover.exists())
 
 
 class UpdateFallbackTests(unittest.TestCase):
@@ -193,13 +275,42 @@ class UpdateFallbackTests(unittest.TestCase):
             "body": "",
             "published_at": "2026-03-01T00:00:00Z",
         }
-        with mock.patch.object(
-            cf, "_fetch_update_json", return_value=dict(payload)
-        ) as fetch:
+        results = {url: dict(payload) for url in cf.RELEASE_INFO_URLS}
+        with mock.patch.object(cf, "_fetch_urls_race", return_value=results):
             info = cf._get_latest_release_info()
         self.assertEqual(info["latest"], "1.4.0")
         self.assertEqual(info["notes"], [cf.FALLBACK_RELEASE_NOTES])
-        fetch.assert_called_once()
+
+    def test_update_json_race_prefers_github_when_reachable(self):
+        github = {
+            "latest": "2.0.0",
+            "download_pages": ["https://github.example/x"],
+            "notes": ["github note"],
+        }
+        gitee = {
+            "latest": "1.5.0",
+            "download_pages": ["https://gitee.example/x"],
+            "notes": ["gitee note"],
+        }
+        results = {
+            cf.UPDATE_INFO_URLS[0]: dict(github),
+            cf.UPDATE_INFO_URLS[1]: dict(gitee),
+        }
+        with mock.patch.object(cf, "_fetch_urls_race", return_value=results):
+            info = cf._get_update_json_info()
+        self.assertEqual(info["latest"], "2.0.0")
+        self.assertIn("github", info["source"])
+
+    def test_update_json_falls_back_to_gitee_when_github_down(self):
+        gitee = {
+            "latest": "1.6.0",
+            "download_pages": ["https://gitee.example/x"],
+        }
+        results = {cf.UPDATE_INFO_URLS[0]: None, cf.UPDATE_INFO_URLS[1]: dict(gitee)}
+        with mock.patch.object(cf, "_fetch_urls_race", return_value=results):
+            info = cf._get_update_json_info()
+        self.assertEqual(info["latest"], "1.6.0")
+        self.assertIn("gitee", info["source"])
 
 
 class SchedulerReorderTests(unittest.TestCase):
@@ -248,6 +359,19 @@ class SchedulerReorderTests(unittest.TestCase):
         for _task, slot in pairs:
             per_slot[slot.slot_id] = per_slot.get(slot.slot_id, 0) + 1
         self.assertEqual(set(per_slot.values()), {2})
+
+    def test_plan_assignment_preserves_intake_order_top_to_bottom(self):
+        # Execution must follow the visible list top-to-bottom, so assignment
+        # keeps the intake order instead of re-sorting by workload.
+        small = make_task("a.mp4")
+        small = cf.replace(small, info=cf.VideoInfo("hevc", 1280, 720, 30.0, duration=1.0, frame_count=30))
+        huge = make_task("b.mp4")
+        huge = cf.replace(huge, info=cf.VideoInfo("hevc", 3840, 2160, 30.0, duration=100.0, frame_count=3000))
+        tasks = [small, huge]
+        gpu = cf.GpuCapability(0, "GPU", 2, frozenset({"hevc"}), frozenset({"h264", "hevc"}))
+        slots = [cf.EncoderSlot(gpu, engine, codec="hevc", slot_id=engine) for engine in range(2)]
+        pairs = cf.plan_task_assignment(tasks, slots, make_settings())
+        self.assertEqual([task.output.name for task, _ in pairs], ["a.mp4", "b.mp4"])
 
     def test_report_with_mixed_settings_writes_generic_header(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -378,6 +502,99 @@ class GuiReorderTests(unittest.TestCase):
         frame.set_draggable(True)
         self.assertTrue(frame._draggable)
         frame.deleteLater()
+
+    def test_begin_card_drag_only_accepts_waiting_tasks(self):
+        window = cf.CodecFoundryWindow()
+        try:
+            source = str(Path("D:/video/source.mp4"))
+            record = {
+                "source": source,
+                "output": str(Path("D:/out/a.mp4")),
+                "filename": "a.mp4",
+            }
+            window._create_task_card(0, record, "waiting")
+            waiting_key = record["output"]
+            window.waiting_order = [waiting_key]
+            self.assertTrue(window.begin_card_drag(waiting_key))
+            self.assertEqual(window._active_drag_key, waiting_key)
+            window.on_card_drag_finished(waiting_key)
+            # running cards cannot be dragged
+            window._update_task_card(waiting_key, "running", 0)
+            self.assertFalse(window.begin_card_drag(waiting_key))
+        finally:
+            window.app_logger.close()
+            window.close_finalized = True
+            window.close()
+
+    def test_drag_moved_live_reorders_waiting_order(self):
+        window = cf.CodecFoundryWindow()
+        try:
+            window.resize(1500, 900)
+            window.show()
+            cf.QApplication.instance().processEvents()
+            source = str(Path("D:/video/source.mp4"))
+            keys = []
+            for index in range(3):
+                record = {
+                    "source": source,
+                    "output": str(Path(f"D:/out/{index}.mp4")),
+                    "filename": f"f{index}.mp4",
+                }
+                window._create_task_card(0, record, "waiting")
+                keys.append(record["output"])
+            window.waiting_order = list(keys)
+            cf.QApplication.instance().processEvents()
+            window.begin_card_drag(keys[0])
+            first_center = window.task_widgets[keys[1]]["frame"].mapToGlobal(
+                window.task_widgets[keys[1]]["frame"].rect().center()
+            ).y()
+            second_center = window.task_widgets[keys[2]]["frame"].mapToGlobal(
+                window.task_widgets[keys[2]]["frame"].rect().center()
+            ).y()
+            midpoint = (first_center + second_center) // 2
+            window.on_card_drag_moved(keys[0], midpoint)
+            self.assertEqual(window.waiting_order, [keys[1], keys[0], keys[2]])
+            window.on_card_drag_finished(keys[0])
+            self.assertEqual(window.waiting_order, [keys[1], keys[0], keys[2]])
+        finally:
+            window.app_logger.close()
+            window.close_finalized = True
+            window.close()
+
+    def test_ffmpeg_setup_window_shows_manual_buttons_on_failure(self):
+        window = cf.FfmpegSetupWindow()
+        try:
+            window._on_progress(
+                {"stage": "download", "name": "x.zip", "done": 50, "total": 100,
+                 "speed": 1024 * 1024, "eta": 5.0}
+            )
+            self.assertIn("50%", window.progress_bar.text())
+            window._on_done({"error": "安装失败", "install_dir": "D:/x"})
+            self.assertTrue(window._failed)
+            self.assertFalse(window.manual_frame.isHidden())
+        finally:
+            window.deleteLater()
+
+    def test_single_instance_preference_defaults_enabled(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_dir = Path(temp_dir) / "data"
+            data_dir.mkdir()
+            (data_dir / "settings.json").write_text(
+                json.dumps({"single_instance": False}), encoding="utf-8"
+            )
+            with mock.patch.object(cf, "APP_SETTINGS_PATH", data_dir / "settings.json"):
+                self.assertFalse(cf.single_instance_preferred())
+            with mock.patch.object(cf, "APP_SETTINGS_PATH", data_dir / "missing.json"):
+                self.assertTrue(cf.single_instance_preferred())
+
+
+class StartupWindowTests(unittest.TestCase):
+    def test_ffmpeg_setup_window_construction(self):
+        app = cf.QApplication.instance() or cf.QApplication([])
+        window = cf.FfmpegSetupWindow()
+        self.assertIsNotNone(window.progress_bar)
+        self.assertIsNotNone(window.detail_label)
+        window.deleteLater()
 
 
 if __name__ == "__main__":

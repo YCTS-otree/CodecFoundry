@@ -1,6 +1,6 @@
-# CodecFoundry v1.2.0 · NVIDIA HEVC / AV1 批量视频压制
+# CodecFoundry v1.3.0 · NVIDIA HEVC / AV1 批量视频压制
 
-当前源码入口为 `CodecFoundry.pyw`，应用内部版本为 1.2.0：PySide6 界面与 FFmpeg/NVENC 调度后端均
+当前源码入口为 `CodecFoundry.pyw`，应用内部版本为 1.3.0：PySide6 界面与 FFmpeg/NVENC 调度后端均
 内置在同一个源码文件中。程序读取 `gpus.json`，按每块卡的编码、解码能力和
 `encoder_engines` 数量调度多个视频。
 
@@ -33,9 +33,10 @@ PySide6 界面采用深灰背景、蓝色操作按钮、橙色进度条和紫色
 - 超宽布局右侧显示按计划编码顺序排列的任务卡；任务栏宽度约从 1080p 下的 300 px
   平滑增至 4K 下的 600 px。卡片包含文件名、源路径、容器、分辨率、帧率、编码格式和原体积；
   等待中可单独取消，进行中可停止，已停止/失败可重新开始，已完成可直接打开输出；
-- 等待中的任务卡支持“长按拖动”重新排序：按住卡片约 0.4 秒即可拖动，松手位置即新顺序。
-  只有尚未开始的任务可被拖动，正在编码/校验的任务不可拖动；新顺序直接写入调度器的真实
-  等待队列，后续任务按新顺序分配，而不是只改显示；
+- 等待中的任务卡支持“长按拖动”重新排序：按住卡片约 0.4 秒会以动效缩小 5%（动效可在
+  设置中关闭），随后卡片只沿 Y 轴跟随鼠标，其他卡片实时避让，松手即在落点插入。只有
+  尚未开始的任务可被拖动，正在编码/校验的任务不可拖动；新顺序直接写入调度器的真实
+  等待队列，队列严格按从上到下的顺序执行；
 - 完成卡会额外显示输出体积、增减量箭头和压缩率，任务较多时右栏可滚动。
 
 总进度按 1080p 等效帧计算：`等效帧 = 帧数 × 输出像素数 / 1920 / 1080`。因此
@@ -46,18 +47,26 @@ PySide6 界面采用深灰背景、蓝色操作按钮、橙色进度条和紫色
 ## 自动更新检查
 
 启动后程序会在后台检查更新（可在“设置”中关闭），帮助菜单中也可手动“检查更新…”。
-正常情况下读取 `update.json`（Gitee 优先，GitHub 备用）；若 update.json 不存在、请求
-失败、内容为空或解析失败，则回退到 GitHub（Gitee API 镜像优先）最新 Release：比较最新
-tag 与当前版本，更高时弹窗展示 Release 正文作为更新说明，并提供按钮直接打开 Release
-页面；说明读取或解析失败时显示“修复BUG”。
+正常路径为 `master` 分支上的 `update.json`：程序会同时向 GitHub 与 Gitee 发起请求，
+不能响应的源直接放弃，两者都可用时 GitHub 优先；若 update.json 不存在、请求失败、
+内容为空或解析失败，则回退到最新 Release（GitHub API 优先、Gitee API 镜像备用）：
+比较最新 tag 与当前版本，更高时弹窗展示 Release 正文作为更新说明（说明读取或解析
+失败时显示“修复BUG”），并提供按钮直接打开 Release 页面。检查结束后底部状态栏会
+同步显示结果（发现新版本 / 已是最新版本 / 无法连接更新服务器）。
 
 ## 快速使用
 
 要求 Python 3.10+、PySide6，以及可正常运行的 NVIDIA 驱动和 `nvidia-smi`。
-FFmpeg/ffprobe 无需手动安装：程序会在 `%APPDATA%\CodecFoundry\ffmpeg` 检测应用自带
-版本（要求 >= 5.1，支持 `-fps_mode`），缺失或版本过旧时自动从国内镜像（Gitee
-`otreee/ffmpeg_build`）下载安装；也可先复制本机已安装的新版 FFmpeg 到该目录。
-所有 FFmpeg/ffprobe 调用都优先使用应用自带版本，不修改系统 PATH，也不写入 C:\Windows。
+FFmpeg/ffprobe 无需手动安装：启动阶段程序先检测 `%APPDATA%\CodecFoundry\ffmpeg`
+中的应用自带版本，其次复用 `%APPDATA%` 下 FlashCut / DJI DPVC 自带的 FFmpeg，再检查
+系统 PATH；都没有或版本低于 5.1（不支持 `-fps_mode`）时，同时向 GitHub
+（GyanD/codexffmpeg 最新 Release，自动解析 tag 与资产）与 Gitee（otreee/ffmpeg_build
+最新 Release）发起下载，最快完成者生效，gyan.dev 仅作最后兜底；压缩包支持 .zip 与
+.7z，并在包内自动搜索 ffmpeg.exe / ffprobe.exe。下载/安装过程显示在独立的
+FFmpeg 初始化窗口中（进度、速度、预计剩余时间），失败时提供“GitHub 源”与
+“中国境内源（Gitee）”两个手动下载按钮。安装完成后可一键“全局安装（UAC）”复制到
+C:\Windows；中断产生的残留 .part 文件会在下次启动时自动清理。所有
+FFmpeg/ffprobe 调用都优先使用上述解析结果，不修改系统 PATH。
 
 ```powershell
 # 检查环境与 JSON
@@ -88,10 +97,10 @@ FlashCut 以 GUI 方式联动时运行 `CodecFoundry.exe --hlm <清单.HLM>`。C
 原片。每个 FFmpeg 任务在原片输入上应用自己的精确 `-ss/-t` 时间窗，然后完成解码、裁切、
 NVENC 编码、输出校验和报告；链路中不存在 FC 临时片段或二次输入视频。
 
-CodecFoundry 采用单实例运行：当已有实例在运行时，FlashCut 再次调用（无论 GUI 还是
-`--cli` 方式）都不会启动第二个完整实例，而是通过本机命名管道把 HLM/任务转发给正在运行
-的实例，追加到其真实编码队列中按现有顺序调度；队列卡片与调度器状态保持一致。转发失败
-（例如实例已退出）时会回退为正常独立执行，请求不会丢失。
+CodecFoundry 默认单实例运行（可在“设置”中关闭）：当已有实例在运行时，FlashCut
+再次调用（无论 GUI 还是 `--cli` 方式）都不会启动第二个完整实例，而是通过本机命名管道
+把 HLM/任务转发给正在运行的实例，追加到其真实编码队列中按现有顺序调度；队列卡片与
+调度器状态保持一致。转发失败（例如实例已退出）时会回退为正常独立执行，请求不会丢失。
 
 HLM 中的 codec、容器、字幕、覆盖和输出目录会初始化 CF 控件；CQ、preset、lookahead 等
 未固定参数使用 CF 当前偏好，开始前仍可调整。CF 会验证 HLM v2、最低 CF 版本、原片路径与
@@ -208,9 +217,10 @@ FFmpeg 每 0.5 秒提供已编码帧数、实际编码 fps、输出时间和 spe
 - 默认复制音频；MP4 中的文本字幕会转换为 `mov_text`。PGS 等位图字幕不能直接写入 MP4，
   可加 `--no-subtitles`，或使用 `--container mkv` 保留原字幕流。
 - GPU 支持某种编码不代表本机 FFmpeg 一定编译了对应编码器；脚本会同时检查。
-- FFmpeg/ffprobe 强制使用 `%APPDATA%\CodecFoundry\ffmpeg` 中的应用自带版本（>= 5.1，
-  支持 `-fps_mode`）；只有显式传入 `--ffmpeg`/`--ffprobe` 时才使用指定路径。自动安装
-  失败时若系统 PATH 存在足够新的版本会临时使用并给出警告。
+- FFmpeg/ffprobe 优先使用应用自带版本（>= 5.1，支持 `-fps_mode`），其次复用
+  FlashCut / DJI DPVC 或系统 PATH 中足够新的版本；只有显式传入 `--ffmpeg`/`--ffprobe`
+  时才使用指定路径。gyan.dev 的 git 构建（无正式版本号，如 `git-2026-02-09-9bfa1635ae`）
+  会按构建日期判断新旧。
 - 即使 JSON 声明可硬解，特殊色度、位深或分辨率也可能超出硬件限制；硬解执行失败时
   默认自动用 CPU 解码重试。可用 `--no-software-fallback` 禁止。
 - `--resolution` 当前按给定宽高直接缩放，不保持宽高比；请传入目标画幅的正确尺寸。
