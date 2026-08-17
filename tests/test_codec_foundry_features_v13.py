@@ -172,12 +172,14 @@ class FfmpegVersionTests(unittest.TestCase):
                 {"name": "ffmpeg.zip", "browser_download_url": "https://gitee.example/ffmpeg.zip"},
                 {"name": "ffprobe.zip", "browser_download_url": "https://gitee.example/ffprobe.zip"},
                 {"name": "notes.txt", "browser_download_url": "https://gitee.example/notes.txt"},
+                {"name": "ffplay.zip", "browser_download_url": "https://gitee.example/ffplay.zip"},
             ],
         }
         with mock.patch.object(cf, "_fetch_update_json", return_value=dict(payload)):
             assets = cf._parse_gitee_ffmpeg_assets()
         self.assertEqual(len(assets), 2)
         self.assertTrue(all(name.endswith(".zip") for name, _ in assets))
+        self.assertFalse(any("ffplay" in name for name, _ in assets))
 
     def test_stale_part_files_are_cleaned_before_install(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -187,9 +189,87 @@ class FfmpegVersionTests(unittest.TestCase):
             leftover = install_dir / ".dl-github"
             leftover.mkdir()
             (leftover / "old.zip").write_bytes(b"junk")
+            (leftover / "old.zip.part").write_bytes(b"junk")
+            extracted = leftover / "extracted"
+            extracted.mkdir()
+            (extracted / "partial.exe").write_bytes(b"x")
             cf._cleanup_stale_downloads(install_dir)
             self.assertEqual(list(install_dir.glob("*.part")), [])
-            self.assertFalse(leftover.exists())
+            self.assertEqual(list(leftover.glob("*.part")), [])
+            self.assertFalse(extracted.exists())
+            # finished archives and the work dir survive so extraction can resume
+            self.assertTrue((leftover / "old.zip").exists())
+
+    def test_archive_readable_accepts_intact_zip(self):
+        import zipfile as zip_module
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive = Path(temp_dir) / "ok.zip"
+            with zip_module.ZipFile(archive, "w") as zip_file:
+                zip_file.writestr("bin/ffmpeg.exe", b"fake")
+            self.assertTrue(cf._archive_readable(archive))
+            archive.write_bytes(b"not a zip")
+            self.assertFalse(cf._archive_readable(archive))
+
+    def test_extraction_prefers_native_7z_over_py7zr(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive = Path(temp_dir) / "x.zip"
+            import zipfile as zip_module
+            with zip_module.ZipFile(archive, "w") as zip_file:
+                zip_file.writestr("ffmpeg.exe", b"fake")
+            with mock.patch.object(cf.shutil, "which", return_value="C:/tools/7z.exe"), \
+                 mock.patch.object(
+                     cf, "_extract_with_native_tool", return_value=True
+                 ) as native:
+                self.assertTrue(cf._extract_archive(archive, Path(temp_dir) / "out"))
+            native.assert_called_once()
+
+    def test_fps_mode_capability_fallback_accepts_unparseable_build(self):
+        def fake_run(command, *args, **kwargs):
+            if "-h" in command:
+                return cf.subprocess.CompletedProcess(
+                    command, 0, "  -fps_mode            force constant frame rate\n", ""
+                )
+            return cf.subprocess.CompletedProcess(
+                command, 0, "ffmpeg version some-unknown-build\n", ""
+            )
+        with mock.patch.object(cf, "run_captured_text", side_effect=fake_run):
+            self.assertTrue(cf.ffmpeg_version_ok("ffmpeg"))
+
+    def test_probe_sources_ranks_fastest_first(self):
+        fast = cf.FfmpegSource("github", "fast", [("a.7z", "https://github.example/a")])
+        slow = cf.FfmpegSource("gitee", "slow", [("b.zip", "https://gitee.example/b")])
+        speeds = {"github": 50 * 1024 * 1024, "gitee": 1024 * 1024}
+        with mock.patch.object(
+            cf, "_probe_download_speed",
+            side_effect=lambda url, timeout=30, cancel_event=None: speeds[
+                "github" if "github" in url else "gitee"
+            ],
+        ):
+            ranked = cf._probe_sources([fast, slow], None)
+        self.assertEqual([source.key for _, source in ranked], ["github", "gitee"])
+
+    def test_resume_uses_downloaded_archive_without_redownload(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            install_dir = Path(temp_dir)
+            import zipfile as zip_module
+            work_dir = install_dir / ".dl-gitee"
+            work_dir.mkdir(parents=True)
+            archive = work_dir / "ffmpeg.zip"
+            with zip_module.ZipFile(archive, "w") as zip_file:
+                zip_file.writestr("ffmpeg.exe", b"fake-ffmpeg")
+                zip_file.writestr("ffprobe.exe", b"fake-ffprobe")
+            source = cf.FfmpegSource("gitee", "gitee", [("ffmpeg.zip", "https://gitee.example/ffmpeg.zip")])
+            with mock.patch.object(cf, "_download_archive", return_value=True) as download, \
+                 mock.patch.object(cf, "ffmpeg_version_ok", return_value=True), \
+                 mock.patch.object(cf, "say"):
+                result = cf._install_from_source(
+                    install_dir, source, None, None, "ffmpeg.exe", "ffprobe.exe"
+                )
+            self.assertTrue(result)
+            download.assert_not_called()
+            # after success the work dir (install packages) is deleted
+            self.assertFalse(work_dir.exists())
+            self.assertTrue((install_dir / "ffmpeg.exe").exists())
 
 
 class UpdateFallbackTests(unittest.TestCase):
@@ -568,10 +648,37 @@ class GuiReorderTests(unittest.TestCase):
                 {"stage": "download", "name": "x.zip", "done": 50, "total": 100,
                  "speed": 1024 * 1024, "eta": 5.0}
             )
-            self.assertIn("50%", window.progress_bar.text())
+            first_bar = next(iter(window._bars.values()))["bar"]
+            self.assertIn("50%", first_bar.text())
             window._on_done({"error": "安装失败", "install_dir": "D:/x"})
             self.assertTrue(window._failed)
             self.assertFalse(window.manual_frame.isHidden())
+        finally:
+            window.deleteLater()
+
+    def test_ffmpeg_setup_window_two_bars_for_two_archives(self):
+        window = cf.FfmpegSetupWindow()
+        try:
+            window._on_progress(
+                {"stage": "download", "name": "ffmpeg.zip", "done": 10, "total": 100,
+                 "speed": 1024 * 1024, "eta": 3.0}
+            )
+            window._on_progress(
+                {"stage": "download", "name": "ffprobe.zip", "done": 20, "total": 100,
+                 "speed": 2048 * 1024, "eta": 2.0}
+            )
+            self.assertEqual(len(window._bars), 2)
+        finally:
+            window.deleteLater()
+
+    def test_setup_window_close_cancels_install(self):
+        window = cf.FfmpegSetupWindow()
+        cancel_event = cf.threading.Event()
+        try:
+            window.set_cancel_event(cancel_event)
+            window.set_install_running(True)
+            window.close()
+            self.assertTrue(cancel_event.is_set())
         finally:
             window.deleteLater()
 
@@ -592,9 +699,51 @@ class StartupWindowTests(unittest.TestCase):
     def test_ffmpeg_setup_window_construction(self):
         app = cf.QApplication.instance() or cf.QApplication([])
         window = cf.FfmpegSetupWindow()
-        self.assertIsNotNone(window.progress_bar)
+        self.assertIsNotNone(window.bar_host)
         self.assertIsNotNone(window.detail_label)
+        self.assertIsNotNone(window.background_button)
+        self.assertIsNotNone(window.close_button)
         window.deleteLater()
+
+
+class FramelessResizeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = cf.QApplication.instance() or cf.QApplication([])
+
+    def test_native_hit_test_returns_border_resize_codes(self):
+        if os.name != "nt":
+            self.skipTest("WM_NCHITTEST resize is Windows-only")
+        window = cf.CodecFoundryWindow()
+        try:
+            window.resize(1000, 800)
+            window.show()
+            self.app.processEvents()
+            rect = window.frameGeometry()
+
+            def nchit(x: int, y: int) -> int:
+                from shiboken6 import VoidPtr
+                message = cf.ctypes.wintypes.MSG()
+                message.message = 0x0084  # WM_NCHITTEST
+                message.lParam = (y << 16) | (x & 0xFFFF)
+                handled, result = window.nativeEvent(
+                    b"windows_generic_MSG", VoidPtr(cf.ctypes.addressof(message))
+                )
+                return int(result) if handled else 0
+
+            border = 3
+            self.assertEqual(nchit(rect.left() + border, rect.center().y()), 10)  # HTLEFT
+            self.assertEqual(nchit(rect.right() - border, rect.center().y()), 11)  # HTRIGHT
+            self.assertEqual(nchit(rect.center().x(), rect.top() + border), 12)  # HTTOP
+            self.assertEqual(nchit(rect.center().x(), rect.bottom() - border), 15)  # HTBOTTOM
+            self.assertEqual(nchit(rect.left() + border, rect.top() + border), 13)  # HTTOPLEFT
+            self.assertEqual(nchit(rect.right() - border, rect.bottom() - border), 17)  # HTBOTTOMRIGHT
+            # Inside the window: default handling (0 = not handled here)
+            self.assertEqual(nchit(rect.center().x(), rect.center().y()), 0)
+        finally:
+            window.app_logger.close()
+            window.close_finalized = True
+            window.close()
 
 
 if __name__ == "__main__":

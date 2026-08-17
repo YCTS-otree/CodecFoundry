@@ -2771,7 +2771,7 @@ def main(
             signal.signal(handled_signal, previous_handler)
 
 
-from PySide6.QtCore import QPoint, Qt, QTimer, QUrl, QVariantAnimation, Signal, QObject
+from PySide6.QtCore import QEvent, QPoint, Qt, QTimer, QUrl, QVariantAnimation, Signal, QObject
 from PySide6.QtGui import QColor, QDesktopServices, QFont, QIcon, QPalette
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
@@ -2796,6 +2796,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSpinBox,
     QSplitter,
+    QSystemTrayIcon,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -2881,15 +2882,26 @@ def _tool_version_tuple(executable: Path | str) -> tuple[int, int, int, int] | N
     return None
 
 
+def _tool_supports_fps_mode(executable: Path | str) -> bool:
+    """Capability fallback: parseable version missing → ask the binary itself."""
+    try:
+        completed = run_captured_text([str(executable), "-hide_banner", "-h", "full"])
+    except OSError:
+        return False
+    return completed.returncode == 0 and "-fps_mode" in completed.stdout
+
+
 def ffmpeg_version_ok(executable: Path | str) -> bool:
     """Return True when the executable runs and is new enough for -fps_mode."""
     version = _tool_version_tuple(executable)
-    if version is None:
-        return False
-    if version[0] >= 1900:
-        # git-build date tuple (e.g. git-2026-02-09): 5.1 shipped 2022-07.
-        return version >= (2022, 7, 1, 0)
-    return version >= MIN_FFMPEG_VERSION
+    if version is not None:
+        if version[0] >= 1900:
+            # git-build date tuple (e.g. git-2026-02-09): 5.1 shipped 2022-07.
+            return version >= (2022, 7, 1, 0)
+        return version >= MIN_FFMPEG_VERSION
+    # No parseable version string: fall back to the actual capability check so
+    # an already-installed valid build never triggers a pointless download.
+    return _tool_supports_fps_mode(executable)
 
 
 def _emit_ffmpeg_setup(
@@ -3086,7 +3098,11 @@ def _parse_github_ffmpeg_assets() -> list[tuple[str, str]] | None:
 
 
 def _parse_gitee_ffmpeg_assets() -> list[tuple[str, str]] | None:
-    """Auto-parse the latest otreee/ffmpeg_build release assets from Gitee."""
+    """Auto-parse the latest otreee/ffmpeg_build release assets from Gitee.
+
+    Only ffmpeg/ffprobe archives are kept; anything else (e.g. ffplay.zip) is
+    ignored — CodecFoundry needs exactly these two binaries.
+    """
     data = _fetch_update_json(FFMPEG_GITEE_RELEASES_API, UPDATE_RELEASE_TIMEOUT)
     if not data:
         return None
@@ -3099,57 +3115,154 @@ def _parse_gitee_ffmpeg_assets() -> list[tuple[str, str]] | None:
             continue
         name = str(asset.get("name") or "")
         url = str(asset.get("browser_download_url") or "")
-        if name and url and name.lower().endswith((".zip", ".7z")):
+        lower = name.lower()
+        if (
+            name
+            and url
+            and lower.endswith((".zip", ".7z"))
+            and (lower.startswith("ffmpeg") or lower.startswith("ffprobe"))
+        ):
             result.append((name, url))
     return result or None
 
 
-def _extract_archive(archive_path: Path, extract_dir: Path) -> bool:
+def _extract_with_native_tool(
+    tool: str, archive_path: Path, extract_dir: Path, abort_event: threading.Event | None
+) -> bool:
+    """Run a native (multithreaded) extractor with abort support and no console."""
+    tool_name = Path(tool).name.lower()
+    if "tar" in tool_name:
+        command = [tool, "-xf", str(archive_path), "-C", str(extract_dir)]
+    else:
+        command = [tool, "x", str(archive_path), f"-o{extract_dir}", "-y"]
+    try:
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=windows_creation_flags(),
+        )
+    except OSError as exc:
+        warn(f"[FFmpeg] 无法启动 {tool}：{exc}")
+        return False
+    while process.poll() is None:
+        if abort_event is not None and abort_event.is_set():
+            try:
+                if os.name == "nt":
+                    subprocess.run(
+                        ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        check=False,
+                        timeout=5,
+                        creationflags=windows_creation_flags(),
+                    )
+                process.kill()
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+            return False
+        time.sleep(0.1)
+    return process.returncode == 0
+
+
+def _extract_archive(
+    archive_path: Path,
+    extract_dir: Path,
+    abort_event: threading.Event | None = None,
+) -> bool:
     extract_dir.mkdir(parents=True, exist_ok=True)
+    # Prefer a native extractor for BOTH formats: 7-Zip / bsdtar are
+    # multithreaded and dramatically faster than the pure-Python paths.
+    seven_zip = shutil.which("7z") or shutil.which("7za")
+    if seven_zip:
+        if _extract_with_native_tool(seven_zip, archive_path, extract_dir, abort_event):
+            return True
+        warn(f"[FFmpeg] 7z 解压 {archive_path.name} 失败，尝试其他方式")
     if archive_path.suffix.lower() == ".7z":
+        tar_tool = shutil.which("tar")
+        if tar_tool:
+            if _extract_with_native_tool(tar_tool, archive_path, extract_dir, abort_event):
+                return True
+            warn("[FFmpeg] tar 解压失败，尝试 py7zr")
         try:
             import py7zr  # type: ignore
         except ImportError:
-            py7zr = None
-        if py7zr is not None:
-            try:
-                with py7zr.SevenZipFile(archive_path, mode="r") as archive:
-                    archive.extractall(extract_dir)
-                return True
-            except Exception as exc:
-                warn(f"[FFmpeg] py7zr 解压失败：{exc}")
-                return False
-        seven_zip = shutil.which("7z") or shutil.which("7za")
-        if seven_zip:
-            completed = run_captured_text(
-                [seven_zip, "x", str(archive_path), f"-o{extract_dir}", "-y"]
-            )
-            if completed.returncode == 0:
-                return True
-            warn(f"[FFmpeg] 系统 7z 解压失败：{error_tail(completed.stderr)}")
-        else:
-            warn("[FFmpeg] 无法解压 .7z：需要 py7zr 或系统 7-Zip")
-        return False
+            warn("[FFmpeg] 无法解压 .7z：需要 7-Zip、系统 tar 或 py7zr")
+            return False
+        try:
+            with py7zr.SevenZipFile(archive_path, mode="r") as archive:
+                archive.extractall(extract_dir)
+            return True
+        except Exception as exc:
+            warn(f"[FFmpeg] py7zr 解压失败：{exc}")
+            return False
+    # Plain zip without a native tool: manual member loop with big buffers,
+    # abort-aware and much faster than extractall's small-copy default.
     try:
         with ZipFile(archive_path) as zip_file:
-            zip_file.extractall(extract_dir)
+            for member in zip_file.infolist():
+                if abort_event is not None and abort_event.is_set():
+                    return False
+                target = extract_dir / member.filename
+                if member.is_dir():
+                    target.mkdir(parents=True, exist_ok=True)
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with zip_file.open(member) as source, open(target, "wb") as output:
+                    while True:
+                        chunk = source.read(4 * 1024 * 1024)
+                        if not chunk:
+                            break
+                        output.write(chunk)
+                        if abort_event is not None and abort_event.is_set():
+                            return False
         return True
     except (OSError, BadZipFile) as exc:
         warn(f"[FFmpeg] 解压 {archive_path.name} 失败：{exc}")
         return False
 
 
+def _archive_readable(archive_path: Path) -> bool:
+    """A listing succeeds on intact archives; corrupt/partial ones fail."""
+    if not archive_path.is_file() or archive_path.stat().st_size <= 0:
+        return False
+    try:
+        if archive_path.suffix.lower() == ".7z":
+            seven_zip = shutil.which("7z") or shutil.which("7za")
+            if seven_zip:
+                completed = run_captured_text([seven_zip, "l", str(archive_path)])
+                return completed.returncode == 0
+            try:
+                import py7zr  # type: ignore
+            except ImportError:
+                return False
+            with py7zr.SevenZipFile(archive_path, mode="r") as archive:
+                archive.getnames()
+            return True
+        with ZipFile(archive_path) as zip_file:
+            zip_file.infolist()
+        return True
+    except Exception:
+        return False
+
+
 def _cleanup_stale_downloads(install_dir: Path) -> None:
-    """Remove partial/interrupted archives left by an abnormal exit (#8)."""
+    """Remove partial downloads; keep finished archives so extraction resumes."""
     for pattern in ("*.part", "*.zip", "*.7z"):
         for stale in install_dir.glob(pattern):
             try:
                 stale.unlink()
             except OSError:
                 pass
-    for leftover in install_dir.glob(".dl-*"):
-        if leftover.is_dir():
-            shutil.rmtree(leftover, ignore_errors=True)
+    for work_dir in install_dir.glob(".dl-*"):
+        if not work_dir.is_dir():
+            continue
+        for partial in work_dir.glob("*.part"):
+            try:
+                partial.unlink()
+            except OSError:
+                pass
+        shutil.rmtree(work_dir / "extracted", ignore_errors=True)
 
 
 def _ffmpeg_progress(
@@ -3181,17 +3294,34 @@ def _install_from_source(
     ffmpeg_name: str,
     ffprobe_name: str,
 ) -> bool:
-    """Download and extract one source's archives, then verify both binaries."""
+    """Download (parallel, resumable) and extract one source's archives.
+
+    Already-downloaded archives are reused when their file listing reads
+    cleanly; after a successful install the whole work directory (archives
+    included) is deleted.
+    """
     work_dir = install_dir / f".dl-{source.key}"
-    shutil.rmtree(work_dir, ignore_errors=True)
     work_dir.mkdir(parents=True, exist_ok=True)
     extracted_root = work_dir / "extracted"
-    for name, url in source.archives:
+    shutil.rmtree(extracted_root, ignore_errors=True)
+
+    download_results: dict[str, bool] = {}
+
+    def download_one(name: str, url: str) -> None:
         if abort_event is not None and abort_event.is_set():
-            return False
+            download_results[name] = False
+            return
         archive_path = work_dir / name
+        if _archive_readable(archive_path):
+            say(f"[FFmpeg] 复用已下载的 {name}，直接继续解压")
+            download_results[name] = True
+            return
+        try:
+            archive_path.unlink(missing_ok=True)
+        except OSError:
+            pass
         referer = "https://gitee.com/" if "gitee.com" in url else None
-        if not _download_archive(
+        download_results[name] = _download_archive(
             url,
             archive_path,
             FFMPEG_DOWNLOAD_RETRIES,
@@ -3199,13 +3329,31 @@ def _install_from_source(
             abort_event,
             label=f"[{source.label}] {name}",
             referer=referer,
-        ):
+        )
+
+    download_threads = [
+        threading.Thread(target=download_one, args=(name, url), daemon=True)
+        for name, url in source.archives
+    ]
+    for thread in download_threads:
+        thread.start()
+    for thread in download_threads:
+        thread.join()
+    if abort_event is not None and abort_event.is_set():
+        return False
+    if not all(download_results.get(name) for name, _ in source.archives):
+        return False
+
+    for name, _url in source.archives:
+        if abort_event is not None and abort_event.is_set():
             return False
+        archive_path = work_dir / name
         _ffmpeg_progress(
             progress_callback, "extract", name=name, detail=f"正在解压 {name}"
         )
-        if not _extract_archive(archive_path, extracted_root):
+        if not _extract_archive(archive_path, extracted_root, abort_event):
             return False
+
     found: dict[str, Path] = {}
     for binary in (ffmpeg_name, ffprobe_name):
         path = _find_file_in_tree(extracted_root, binary)
@@ -3231,44 +3379,90 @@ def _install_from_source(
                 pass
             return False
         say(f"[FFmpeg] 已安装 {binary}（来源：{source.label}）")
+    # Success: the install packages are no longer needed.
+    shutil.rmtree(work_dir, ignore_errors=True)
     return True
 
 
-def _race_ffmpeg_sources(
-    install_dir: Path,
+def _probe_download_speed(
+    url: str, timeout: float = 30.0, cancel_event: threading.Event | None = None
+) -> float | None:
+    """Measure a source's early-transfer speed; None when unreachable."""
+    if cancel_event is not None and cancel_event.is_set():
+        return None
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0.0.0 Safari/537.36"
+        ),
+    }
+    if "gitee.com" in url:
+        headers["Referer"] = "https://gitee.com/"
+    started = time.monotonic()
+    try:
+        request = Request(url, headers=headers)
+        with urlopen(request, timeout=timeout) as response:
+            total = 0
+            for _ in range(4):
+                if cancel_event is not None and cancel_event.is_set():
+                    return None
+                chunk = response.read(256 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+    except Exception as exc:
+        warn(f"[FFmpeg] 测速失败：{url}（{exc}）")
+        return None
+    elapsed = time.monotonic() - started
+    if elapsed <= 0 or total <= 0:
+        return None
+    return total / elapsed
+
+
+def _probe_sources(
     sources: Sequence[FfmpegSource],
     progress_callback,
-    ffmpeg_name: str,
-    ffprobe_name: str,
-) -> bool:
-    """Download all sources concurrently; the fastest complete install wins."""
-    winner = threading.Event()
-    results: dict[str, bool] = {}
+    cancel_event: threading.Event | None = None,
+) -> list[tuple[float, FfmpegSource]]:
+    """Probe every source concurrently (30s cap); fastest reachable first."""
+    speeds: dict[str, float | None] = {}
 
-    def attempt(source: FfmpegSource) -> None:
-        try:
-            results[source.key] = _install_from_source(
-                install_dir, source, progress_callback, winner, ffmpeg_name, ffprobe_name
-            )
-        except Exception as exc:
-            warn(f"[FFmpeg] {source.label} 安装异常：{exc}")
-            results[source.key] = False
-        finally:
-            if results.get(source.key):
-                winner.set()
+    def probe_one(source: FfmpegSource) -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            speeds[source.key] = None
+            return
+        _ffmpeg_progress(
+            progress_callback, "probe", detail=f"正在测速：{source.label}"
+        )
+        first_url = source.archives[0][1] if source.archives else ""
+        speeds[source.key] = (
+            _probe_download_speed(first_url, cancel_event=cancel_event)
+            if first_url
+            else None
+        )
 
     threads = [
-        threading.Thread(target=attempt, args=(source,), daemon=True)
+        threading.Thread(target=probe_one, args=(source,), daemon=True)
         for source in sources
     ]
     for thread in threads:
         thread.start()
     for thread in threads:
         thread.join()
-    return any(results.get(source.key) for source in sources)
+    ranked = []
+    for source in sources:
+        speed = speeds.get(source.key)
+        if speed is not None:
+            say(f"[FFmpeg] {source.label} 测速 {format_file_size(speed)}/s")
+            ranked.append((speed, source))
+    ranked.sort(key=lambda item: -item[0])
+    return ranked
 
 
-def _install_ffmpeg_binaries(install_dir: Path, progress_callback=None) -> bool:
+def _install_ffmpeg_binaries(
+    install_dir: Path, progress_callback=None, cancel_event: threading.Event | None = None
+) -> bool:
     global _ffmpeg_installed_this_run
     _cleanup_stale_downloads(install_dir)
     marker = install_dir / ".install_failed"
@@ -3295,18 +3489,26 @@ def _install_ffmpeg_binaries(install_dir: Path, progress_callback=None) -> bool:
         sources.append(
             FfmpegSource("gitee", "Gitee 镜像（otreee/ffmpeg_build）", gitee_assets)
         )
+    # Speed-test before downloading anything: only the fastest source is used.
     if sources:
         _ffmpeg_progress(
             progress_callback,
             "start",
-            detail="同时向 GitHub 与 Gitee 发起下载请求，最快完成者生效……",
+            detail="正在对 GitHub 与 Gitee 下载源测速，选择最快路径……",
         )
-        if _race_ffmpeg_sources(
-            install_dir, sources, progress_callback, ffmpeg_name, ffprobe_name
-        ):
-            _ffmpeg_installed_this_run = True
-            return True
-        warn("[FFmpeg] GitHub / Gitee 下载均未完成，尝试 gyan.dev 兜底……")
+        ranked = _probe_sources(sources, progress_callback, cancel_event)
+        for _speed, source in ranked:
+            if cancel_event is not None and cancel_event.is_set():
+                return False
+            _ffmpeg_progress(
+                progress_callback, "start", detail=f"已选择最快下载源：{source.label}"
+            )
+            if _install_from_source(
+                install_dir, source, progress_callback, cancel_event, ffmpeg_name, ffprobe_name
+            ):
+                _ffmpeg_installed_this_run = True
+                return True
+        warn("[FFmpeg] 首选下载源失败，尝试 gyan.dev 兜底……")
     else:
         warn("[FFmpeg] 未能获取 GitHub / Gitee 下载信息，直接使用 gyan.dev 兜底")
     gyan_source = FfmpegSource(
@@ -3314,8 +3516,8 @@ def _install_ffmpeg_binaries(install_dir: Path, progress_callback=None) -> bool:
         "gyan.dev",
         [("ffmpeg-release-full.7z", FFMPEG_GYAN_FALLBACK_URL)],
     )
-    if _install_from_source(
-        install_dir, gyan_source, progress_callback, None, ffmpeg_name, ffprobe_name
+    if _probe_download_speed(FFMPEG_GYAN_FALLBACK_URL) is not None and _install_from_source(
+        install_dir, gyan_source, progress_callback, cancel_event, ffmpeg_name, ffprobe_name
     ):
         _ffmpeg_installed_this_run = True
         return True
@@ -3326,11 +3528,14 @@ def _install_ffmpeg_binaries(install_dir: Path, progress_callback=None) -> bool:
     return False
 
 
-def ensure_ffmpeg_runtime(progress_callback=None) -> tuple[Path, Path]:
+def ensure_ffmpeg_runtime(
+    progress_callback=None, cancel_event: threading.Event | None = None
+) -> tuple[Path, Path]:
     """Return CodecFoundry-usable FFmpeg/ffprobe, installing them when needed.
 
     Order: own install → FlashCut / DJI DPVC under %APPDATA% → system PATH →
-    fresh download.  Raises TranscodeError only when nothing usable exists.
+    fresh download.  Raises TranscodeError only when nothing usable exists or
+    the caller cancelled the installation.
     """
     global _ffmpeg_runtime_cache
     with _ffmpeg_runtime_lock:
@@ -3356,7 +3561,9 @@ def ensure_ffmpeg_runtime(progress_callback=None) -> tuple[Path, Path]:
             "start",
             detail="本地 FFmpeg 缺失或版本过旧（需要 >= 5.1 以支持 -fps_mode），正在自动安装",
         )
-        installed = _install_ffmpeg_binaries(install_dir, progress_callback)
+        installed = _install_ffmpeg_binaries(install_dir, progress_callback, cancel_event)
+        if cancel_event is not None and cancel_event.is_set():
+            raise TranscodeError("FFmpeg 安装已取消")
         if installed and ffmpeg_version_ok(own_ffmpeg) and ffmpeg_version_ok(own_ffprobe):
             _ffmpeg_progress(progress_callback, "done", detail="应用自带 FFmpeg 已就绪")
             _ffmpeg_runtime_cache = (own_ffmpeg, own_ffprobe)
@@ -4903,24 +5110,34 @@ class _FfmpegSetupBridge(QObject):
 
 
 class FfmpegSetupWindow(QDialog):
-    """Startup FFmpeg provisioning window: progress, speed, ETA and fallback UI.
+    """Startup FFmpeg provisioning window.
 
-    It appears while the main window stays unstarted, so the very first thing a
-    user sees during an install/update is this dedicated window rather than a
-    bare message box.
+    - One progress bar per downloaded archive (Gitee's two files get two
+      stacked bars), each showing its own progress/speed/ETA.
+    - Supports minimize-to-tray while the install keeps running, plus an
+      explicit "后台加载" button in the bottom-right.
+    - Closing the window during an install cancels the download threads so the
+      process can exit without background leftovers.
     """
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self.setWindowTitle(f"{APP_NAME} · FFmpeg 初始化")
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
-        self.setMinimumWidth(520)
+        self.setWindowFlag(Qt.WindowType.WindowMinimizeButtonHint, True)
+        self.setMinimumWidth(560)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.bridge = _FfmpegSetupBridge(self)
         self.bridge.progress.connect(self._on_progress)
         self.bridge.done.connect(self._on_done)
         self._install_done = False
         self._failed = False
+        self._install_running = False
+        self._cancel_requested = False
+        self._cancel_event: threading.Event | None = None
+        self._bars: dict[str, dict[str, QWidget]] = {}
+        self._tray: QSystemTrayIcon | None = None
+        self._build_tray()
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 20, 24, 20)
@@ -4929,12 +5146,9 @@ class FfmpegSetupWindow(QDialog):
         self.title_label.setObjectName("sectionTitle")
         layout.addWidget(self.title_label)
 
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setObjectName("orangeProgress")
-        self.progress_bar.setRange(0, 1000)
-        self.progress_bar.setTextVisible(True)
-        self.progress_bar.setFormat("%p%")
-        layout.addWidget(self.progress_bar)
+        self.bar_host = QVBoxLayout()
+        self.bar_host.setSpacing(10)
+        layout.addLayout(self.bar_host)
 
         self.stage_label = QLabel("正在检查本地 FFmpeg 版本（需要 >= 5.1）…")
         self.stage_label.setWordWrap(True)
@@ -4976,18 +5190,127 @@ class FfmpegSetupWindow(QDialog):
         self.manual_frame.hide()
         layout.addWidget(self.manual_frame)
 
+        bottom_row = QHBoxLayout()
+        self.background_button = QPushButton("后台加载")
+        self.background_button.setObjectName("smallButton")
+        self.background_button.setToolTip("最小化到系统托盘，安装会在后台继续")
+        self.background_button.clicked.connect(self._minimize_to_tray)
+        self.background_button.hide()
+        bottom_row.addStretch(1)
+        bottom_row.addWidget(self.background_button)
         self.close_button = QPushButton("关闭")
         self.close_button.setObjectName("primaryButton")
-        self.close_button.setMinimumWidth(140)
-        self.close_button.clicked.connect(self.reject)
+        self.close_button.setMinimumWidth(120)
+        self.close_button.clicked.connect(self.close)
         self.close_button.hide()
-        layout.addWidget(self.close_button, 0, Qt.AlignmentFlag.AlignRight)
+        bottom_row.addWidget(self.close_button)
+        layout.addLayout(bottom_row)
+
+        self.installEventFilter(self)
+
+    # -- tray -------------------------------------------------------------
+
+    def _build_tray(self) -> None:
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        icon = load_application_icon()
+        if icon is None:
+            icon = QIcon()
+        self._tray = QSystemTrayIcon(icon, self)
+        self._tray.setToolTip(f"{APP_NAME} · FFmpeg 初始化")
+        menu = QMenu()
+        show_action = menu.addAction("显示安装窗口")
+        show_action.triggered.connect(self._restore_from_tray)
+        exit_action = menu.addAction("取消安装并退出")
+        exit_action.triggered.connect(self._cancel_install)
+        self._tray.setContextMenu(menu)
+        self._tray.activated.connect(
+            lambda reason: self._restore_from_tray()
+            if reason
+            in (
+                QSystemTrayIcon.ActivationReason.Trigger,
+                QSystemTrayIcon.ActivationReason.DoubleClick,
+            )
+            else None
+        )
+        self._tray.show()
+
+    def _minimize_to_tray(self) -> None:
+        if self._tray is None:
+            # No tray support on this session: fall back to the taskbar.
+            self.showMinimized()
+            return
+        self.hide()
+        self._tray.showMessage(
+            APP_NAME,
+            "FFmpeg 正在后台加载，完成后会自动进入主界面。",
+            QSystemTrayIcon.MessageIcon.Information,
+            4000,
+        )
+
+    def _restore_from_tray(self) -> None:
+        self.showNormal()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def _cancel_install(self) -> None:
+        if self._cancel_event is not None:
+            self._cancel_event.set()
+        self._cancel_requested = True
+        self.close()
+
+    def eventFilter(self, watched, event) -> bool:
+        if watched is self and event.type() == QEvent.Type.WindowStateChange:
+            if self.isMinimized():
+                QTimer.singleShot(0, self._minimize_to_tray)
+        return super().eventFilter(watched, event)
+
+    def closeEvent(self, event) -> None:
+        if self._install_running and not self._cancel_requested:
+            # Closing during an install cancels the downloads so the process
+            # can exit without background leftovers (severe bug #0).
+            self._cancel_requested = True
+            if self._cancel_event is not None:
+                self._cancel_event.set()
+        event.accept()
+
+    # -- wiring -----------------------------------------------------------
+
+    def set_cancel_event(self, cancel_event: threading.Event) -> None:
+        self._cancel_event = cancel_event
+
+    def set_install_running(self, running: bool) -> None:
+        self._install_running = running
+        self.background_button.setVisible(running and not self._failed)
 
     def report_progress(self, payload: dict) -> None:
         self.bridge.progress.emit(dict(payload))
 
     def report_done(self, payload: dict) -> None:
         self.bridge.done.emit(dict(payload))
+
+    def _ensure_bar(self, name: str) -> dict[str, QWidget]:
+        existing = self._bars.get(name)
+        if existing is not None:
+            return existing
+        row = QWidget()
+        row_layout = QVBoxLayout(row)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        row_layout.setSpacing(2)
+        label = QLabel(name)
+        label.setObjectName("hint")
+        bar = QProgressBar()
+        bar.setObjectName("orangeProgress")
+        bar.setRange(0, 1000)
+        bar.setTextVisible(True)
+        bar.setFormat("%p%")
+        row_layout.addWidget(label)
+        row_layout.addWidget(bar)
+        self.bar_host.addWidget(row)
+        entry = {"frame": row, "label": label, "bar": bar}
+        self._bars[name] = entry
+        return entry
 
     def _on_progress(self, raw: object) -> None:
         payload = dict(raw) if isinstance(raw, dict) else {}
@@ -4999,29 +5322,33 @@ class FfmpegSetupWindow(QDialog):
             total = int(payload.get("total") or 0)
             speed = float(payload.get("speed") or 0)
             eta = payload.get("eta")
-            self.title_label.setText(f"正在下载 FFmpeg · {name}")
+            self.title_label.setText("正在下载 FFmpeg")
+            bar_entry = self._ensure_bar(name)
+            bar = bar_entry["bar"]
             if total > 0:
-                self.progress_bar.setRange(0, 1000)
-                self.progress_bar.setValue(round(done / total * 1000))
-                self.progress_bar.setFormat(
+                bar.setRange(0, 1000)
+                bar.setValue(round(done / total * 1000))
+                bar.setFormat(
                     f"{done / total * 100:.0f}% · "
                     f"{format_file_size(done)} / {format_file_size(total)}"
                 )
             else:
-                self.progress_bar.setRange(0, 0)
-                self.progress_bar.setFormat(f"已下载 {format_file_size(done)}")
-            speed_text = (
-                f"{format_file_size(speed)}/s" if speed > 0 else "--"
-            )
+                bar.setRange(0, 0)
+                bar.setFormat(f"已下载 {format_file_size(done)}")
+            speed_text = f"{format_file_size(speed)}/s" if speed > 0 else "--"
             eta_text = (
-                f"预计剩余 {int(eta)} 秒" if isinstance(eta, (int, float)) and eta >= 0 else ""
+                f"预计剩余 {int(eta)} 秒"
+                if isinstance(eta, (int, float)) and eta >= 0
+                else ""
             )
-            self.detail_label.setText(f"速度：{speed_text} · {eta_text}")
+            bar_entry["label"].setText(f"{name} · 速度 {speed_text} · {eta_text}")
         elif stage == "extract":
-            self.title_label.setText(f"正在解压 {name} …")
-            self.stage_label.setText(detail or "正在解压压缩包")
-            self.progress_bar.setRange(0, 0)
-            self.progress_bar.setFormat("解压中")
+            self.title_label.setText("正在解压 FFmpeg …")
+            self.stage_label.setText(detail or f"正在解压 {name}")
+            if name:
+                bar_entry = self._ensure_bar(name)
+                bar_entry["bar"].setRange(0, 0)
+                bar_entry["bar"].setFormat("解压中")
         else:
             self.title_label.setText(detail or "正在准备 FFmpeg …")
             self.stage_label.setText(detail or "")
@@ -5029,18 +5356,27 @@ class FfmpegSetupWindow(QDialog):
     def _on_done(self, raw: object) -> None:
         payload = dict(raw) if isinstance(raw, dict) else {}
         self._install_done = bool(payload.get("installed"))
+        self.set_install_running(False)
         if payload.get("error"):
             self._failed = True
             self.title_label.setText("FFmpeg 初始化失败")
-            self.progress_bar.setRange(0, 1000)
-            self.progress_bar.setValue(0)
-            self.progress_bar.setFormat("失败")
+            for bar_entry in self._bars.values():
+                bar_entry["bar"].setRange(0, 1000)
+                bar_entry["bar"].setValue(0)
+                bar_entry["bar"].setFormat("失败")
             self.stage_label.setText(str(payload.get("error")))
             self.detail_label.setText(
                 f"安装目录：{payload.get('install_dir', FFMPEG_INSTALL_DIR)}"
             )
             self.manual_frame.show()
             self.close_button.show()
+            if not self.isVisible() and self._tray is not None:
+                self._tray.showMessage(
+                    APP_NAME,
+                    "FFmpeg 安装失败，请打开安装窗口查看详情。",
+                    QSystemTrayIcon.MessageIcon.Critical,
+                    6000,
+                )
 
 
 def load_app_preferences() -> dict[str, object]:
@@ -5219,7 +5555,8 @@ class CodecFoundryWindow(QMainWindow):
 
         self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
         self.main_splitter.setChildrenCollapsible(False)
-        self.main_splitter.setHandleWidth(1)
+        self.main_splitter.setHandleWidth(6)
+        self.main_splitter.setCursor(Qt.CursorShape.SizeHorCursor)
         body_layout.addWidget(self.main_splitter, 1)
 
         self.left_shell = QWidget()
@@ -5582,6 +5919,45 @@ class CodecFoundryWindow(QMainWindow):
             self.title_bar.maximize_button.setText("□")
             self.title_bar.maximize_button.setToolTip("最大化")
 
+    def nativeEvent(self, event_type, message):
+        """Frameless window: re-enable native border resize via WM_NCHITTEST."""
+        if os.name == "nt" and event_type == b"windows_generic_MSG":
+            try:
+                native_message = ctypes.wintypes.MSG.from_address(int(message))
+            except (ValueError, TypeError):
+                return super().nativeEvent(event_type, message)
+            if native_message.message == 0x0084:  # WM_NCHITTEST
+                if self.isMaximized() or self.isFullScreen():
+                    return super().nativeEvent(event_type, message)
+                x = ctypes.c_short(native_message.lParam & 0xFFFF).value
+                y = ctypes.c_short((native_message.lParam >> 16) & 0xFFFF).value
+                rect = self.frameGeometry()
+                border = 6
+                on_left = x < rect.left() + border
+                on_right = x > rect.right() - border
+                on_top = y < rect.top() + border
+                on_bottom = y > rect.bottom() - border
+                hit = None
+                if on_top and on_left:
+                    hit = 13  # HTTOPLEFT
+                elif on_top and on_right:
+                    hit = 14  # HTTOPRIGHT
+                elif on_bottom and on_left:
+                    hit = 16  # HTBOTTOMLEFT
+                elif on_bottom and on_right:
+                    hit = 17  # HTBOTTOMRIGHT
+                elif on_left:
+                    hit = 10  # HTLEFT
+                elif on_right:
+                    hit = 11  # HTRIGHT
+                elif on_top:
+                    hit = 12  # HTTOP
+                elif on_bottom:
+                    hit = 15  # HTBOTTOM
+                if hit is not None:
+                    return True, hit
+        return super().nativeEvent(event_type, message)
+
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         self._apply_responsive_layout()
@@ -5615,7 +5991,7 @@ class CodecFoundryWindow(QMainWindow):
     @staticmethod
     def _task_sidebar_width_for_physical_screen(physical_height: float) -> int:
         scale = max(0.0, min(1.0, (physical_height - 1080.0) / 1080.0))
-        return round(300 + 300 * scale)
+        return round(360 + 240 * scale)
 
     def _apply_responsive_layout(self) -> None:
         if not hasattr(self, "task_sidebar"):
@@ -6920,10 +7296,11 @@ class CodecFoundryWindow(QMainWindow):
             "  5. 支持直接拖入视频文件或文件夹\n"
             "  6. 单实例运行（可在设置关闭）：FlashCut 重复联动合并进现有编码队列\n"
             "  7. 等待任务长按缩小 5% 动效拖拽排序（可关动效），队列自上而下执行\n"
-            "  8. 启动期 FFmpeg 专用进度窗口：速度 / 剩余时间，可一键全局安装（UAC）\n"
-            "  9. FFmpeg 自动检测与安装：复用 FlashCut / DJI DPVC，GitHub 与 Gitee\n"
-            "     并发下载取最快，gyan.dev 兜底，支持 .7z 自动解析\n"
-            " 10. 启动自动检查更新（update.json 并发竞速、GitHub 优先 / Releases 回退）"
+            "  8. 启动期 FFmpeg 专用窗口：双进度条 / 速度 / 剩余时间，支持托盘\n"
+            "     “后台加载”，关闭窗口取消安装不留后台进程，可一键全局安装（UAC）\n"
+            "  9. FFmpeg 自动检测与安装：复用 FlashCut / DJI DPVC，先测速选最快\n"
+            "     源（GitHub / Gitee），断点续传解压，原生多线程解压，gyan.dev 兜底\n"
+            " 10. 主窗口支持拖动边框原生缩放；启动自动检查更新（并发竞速、GitHub 优先）"
         )
         changes.setWordWrap(True)
         changes.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
@@ -7227,12 +7604,16 @@ class CodecFoundryWindow(QMainWindow):
 
 
 def run_ffmpeg_startup_phase() -> bool:
-    """Provision FFmpeg before the main window exists; False on failure.
+    """Provision FFmpeg before the main window exists; False on failure/cancel.
 
-    The dedicated FfmpegSetupWindow shows progress, speed and ETA while the
-    main interface stays unstarted.
+    The dedicated FfmpegSetupWindow shows per-archive progress, speed and ETA
+    while the main interface stays unstarted; it can be minimized to the tray
+    ("后台加载") and closing it cancels the install so the process exits cleanly
+    without background leftovers.
     """
     setup = FfmpegSetupWindow()
+    cancel_event = threading.Event()
+    setup.set_cancel_event(cancel_event)
     outcome: dict[str, object] = {}
     finished = threading.Event()
 
@@ -7254,15 +7635,19 @@ def run_ffmpeg_startup_phase() -> bool:
     def worker() -> None:
         try:
             ffmpeg_path, ffprobe_path = ensure_ffmpeg_runtime(
-                progress_callback=progress_callback
+                progress_callback=progress_callback, cancel_event=cancel_event
             )
             outcome["ffmpeg"] = str(ffmpeg_path)
             outcome["ffprobe"] = str(ffprobe_path)
             outcome["installed"] = ffmpeg_installed_this_run()
         except TranscodeError as exc:
-            outcome["error"] = str(exc)
+            if cancel_event.is_set():
+                outcome["cancelled"] = True
+            else:
+                outcome["error"] = str(exc)
         finished.set()
 
+    setup.set_install_running(True)
     threading.Thread(
         target=worker, daemon=True, name="CodecFoundryFfmpegSetup"
     ).start()
@@ -7284,6 +7669,10 @@ def run_ffmpeg_startup_phase() -> bool:
         application.processEvents()
     show_timer.stop()
     setup._on_done(outcome)
+    if outcome.get("cancelled"):
+        setup._cancel_requested = True
+        setup.close()
+        return False
     if outcome.get("error"):
         setup.show()
         setup.raise_()

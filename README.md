@@ -18,7 +18,9 @@ PySide6 界面采用深灰背景、蓝色操作按钮、橙色进度条和紫色
 “停止全部”或在任务运行时关闭窗口，
 都会取消队列并终止所有活动 FFmpeg 进程，而不是只停止当前视频。
 在 Windows 上拖动自定义标题栏时优先交由系统窗口管理器处理，因此拖到屏幕顶部松开会
-像普通窗口一样触发最大化；其他平台也提供顶部松开最大化的兼容路径。
+像普通窗口一样触发最大化；其他平台也提供顶部松开最大化的兼容路径。无边框主窗口支持
+用鼠标拖动四边与四角进行原生缩放（含 Windows 边缘贴靠），任务栏与主区域之间的分隔条
+加宽到 6px 便于拖动，1080p 下任务栏最小宽度提升至 360px。
 
 每个编码槽（E0、E1……）都有当前文件进度/ETA 和整条队列进度/ETA。窗口较宽时最多按
 两列排布，较窄时改为单列；高度不足时引擎区域显示纵向滚动条。点击“设置”会打开独立
@@ -58,15 +60,20 @@ PySide6 界面采用深灰背景、蓝色操作按钮、橙色进度条和紫色
 
 要求 Python 3.10+、PySide6，以及可正常运行的 NVIDIA 驱动和 `nvidia-smi`。
 FFmpeg/ffprobe 无需手动安装：启动阶段程序先检测 `%APPDATA%\CodecFoundry\ffmpeg`
-中的应用自带版本，其次复用 `%APPDATA%` 下 FlashCut / DJI DPVC 自带的 FFmpeg，再检查
-系统 PATH；都没有或版本低于 5.1（不支持 `-fps_mode`）时，同时向 GitHub
-（GyanD/codexffmpeg 最新 Release，自动解析 tag 与资产）与 Gitee（otreee/ffmpeg_build
-最新 Release）发起下载，最快完成者生效，gyan.dev 仅作最后兜底；压缩包支持 .zip 与
-.7z，并在包内自动搜索 ffmpeg.exe / ffprobe.exe。下载/安装过程显示在独立的
-FFmpeg 初始化窗口中（进度、速度、预计剩余时间），失败时提供“GitHub 源”与
-“中国境内源（Gitee）”两个手动下载按钮。安装完成后可一键“全局安装（UAC）”复制到
-C:\Windows；中断产生的残留 .part 文件会在下次启动时自动清理。所有
-FFmpeg/ffprobe 调用都优先使用上述解析结果，不修改系统 PATH。
+中的应用自带版本（含 gyan git 构建与无正式版本号构建的兼容判定，最终以
+`-fps_mode` 能力为准），其次复用 `%APPDATA%` 下 FlashCut / DJI DPVC 自带的
+FFmpeg，再检查系统 PATH；都没有或版本低于 5.1 时，先对 GitHub
+（GyanD/codexffmpeg 最新 Release，自动解析 tag 与资产）与 Gitee
+（otreee/ffmpeg_build 最新 Release，只取 ffmpeg/ffprobe 两个包）做 30 秒测速，
+只从最快的一个源下载（Gitee 的两个文件并行下载、进度窗口上下两条进度条），
+gyan.dev 仅作最后兜底；压缩包支持 .zip 与 .7z（优先调用原生 7-Zip/bsdtar
+多线程解压，速度远快于纯 Python），并在包内自动搜索 ffmpeg.exe / ffprobe.exe。
+已下载完的压缩包会先验证文件列表，完好则跳过下载直接继续解压；安装完成后删除
+安装包，中断产生的残留 .part 文件会在下次启动时自动清理。下载/安装过程显示在
+独立的 FFmpeg 初始化窗口中（每条下载进度、速度、预计剩余时间），可最小化到系统
+托盘“后台加载”；关闭窗口会取消安装并干净退出，不留后台进程。安装完成后可一键
+“全局安装（UAC）”复制到 C:\Windows。所有 FFmpeg/ffprobe 调用都优先使用上述解析
+结果，不修改系统 PATH。
 
 ```powershell
 # 检查环境与 JSON
