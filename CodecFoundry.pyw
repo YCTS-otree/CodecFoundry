@@ -325,16 +325,23 @@ class ProcessController:
                 for pid, process in self._processes.items()
                 if self._process_tasks.get(pid) == task_key
             ]
-        for process in processes:
-            self._request_stop(process)
-        deadline = time.monotonic() + max(0.0, grace_seconds)
-        while time.monotonic() < deadline and any(
-            process.poll() is None for process in processes
-        ):
-            time.sleep(0.05)
-        for process in processes:
-            if process.poll() is None:
-                self._force_stop(process)
+        try:
+            for process in processes:
+                try:
+                    self._request_stop(process)
+                except Exception:
+                    say(f"[进程] 请求停止 PID {process.pid} 失败，等待强制清扫")
+            deadline = time.monotonic() + max(0.0, grace_seconds)
+            while time.monotonic() < deadline and any(
+                process.poll() is None for process in processes
+            ):
+                time.sleep(0.05)
+        finally:
+            # The force sweep must run even if a stop request raised, or the
+            # task would keep encoding forever.
+            for process in processes:
+                if process.poll() is None:
+                    self._force_stop(process)
 
     def active_count(self) -> int:
         with self._lock:
@@ -342,20 +349,29 @@ class ProcessController:
 
     def cancel(self, grace_seconds: float = 1.0) -> None:
         self.cancel_event.set()
-        with self._lock:
-            processes = list(self._processes.values())
-        for process in processes:
-            self._request_stop(process)
-        deadline = time.monotonic() + max(0.0, grace_seconds)
-        while time.monotonic() < deadline and any(process.poll() is None for process in processes):
-            time.sleep(0.05)
-        # Second sweep: force-stop anything still alive, including processes
-        # registered while the grace window was running.
-        with self._lock:
-            processes = list(self._processes.values())
-        for process in processes:
-            if process.poll() is None:
-                self._force_stop(process)
+        try:
+            with self._lock:
+                processes = list(self._processes.values())
+            for process in processes:
+                try:
+                    self._request_stop(process)
+                except Exception:
+                    say(f"[进程] 请求停止 PID {process.pid} 失败，等待强制清扫")
+            deadline = time.monotonic() + max(0.0, grace_seconds)
+            while time.monotonic() < deadline and any(
+                process.poll() is None for process in processes
+            ):
+                time.sleep(0.05)
+        finally:
+            # Second sweep: force-stop anything still alive, including
+            # processes registered while the grace window was running.  Must
+            # run even when a stop request raised (a console-less Windows GUI
+            # used to abort here and leave one encoder running forever).
+            with self._lock:
+                processes = list(self._processes.values())
+            for process in processes:
+                if process.poll() is None:
+                    self._force_stop(process)
 
     def force_stop_all(self) -> None:
         """Force-stop every registered process (used after a full cancel)."""
@@ -369,16 +385,22 @@ class ProcessController:
     def _request_stop(process: subprocess.Popen[str]) -> None:
         if process.poll() is not None:
             return
-        try:
-            if os.name == "nt" and hasattr(signal, "CTRL_BREAK_EVENT"):
-                process.send_signal(signal.CTRL_BREAK_EVENT)
-            elif os.name != "nt":
-                os.killpg(process.pid, signal.SIGTERM)
-            else:
+        if os.name == "nt":
+            # CTRL_BREAK via GenerateConsoleCtrlEvent never reaches the
+            # CREATE_NO_WINDOW children this app spawns: it is silently
+            # ignored when called from a console, and it raises SystemError
+            # (WinError 6, invalid handle) when the caller has no console at
+            # all - which aborted the whole cancel loop before.  A hard
+            # terminate is the only reliable stop, and cancelled outputs are
+            # removed afterwards, so a graceful flush buys nothing.
+            try:
                 process.terminate()
+            except (OSError, ProcessLookupError):
+                pass
+            return
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
         except (OSError, ProcessLookupError):
-            # A console-less child cannot receive CTRL_BREAK; fall back to a
-            # plain terminate instead of waiting for the force-kill sweep.
             try:
                 process.terminate()
             except (OSError, ProcessLookupError):
@@ -4814,10 +4836,31 @@ class TaskCardFrame(QFrame):
 
 
 class TaskHostWidget(QWidget):
-    """Sidebar container for queue cards."""
+    """Sidebar container for queue cards.
+
+    The sidebar layout is disabled and card positions are managed manually,
+    so this host also drives a reflow whenever the splitter changes its
+    width: cards must resize to the new width or they get clipped.
+    """
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
+        self.on_resize: Callable[[], None] | None = None
+        self._resize_reflow_pending = False
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if self.on_resize is None or self._resize_reflow_pending:
+            return
+        # Coalesce the burst of resize events a splitter drag produces into
+        # one reflow per event-loop pass.
+        self._resize_reflow_pending = True
+        QTimer.singleShot(0, self._run_resize_reflow)
+
+    def _run_resize_reflow(self) -> None:
+        self._resize_reflow_pending = False
+        if self.on_resize is not None:
+            self.on_resize()
 
 
 class TitleBar(QWidget):
@@ -5965,6 +6008,7 @@ class CodecFoundryWindow(QMainWindow):
         self.task_scroll = scroll
         self.task_host = TaskHostWidget()
         self.task_host.setObjectName("contentHost")
+        self.task_host.on_resize = self._on_task_host_resized
         self.task_layout = QVBoxLayout(self.task_host)
         # Positions are managed by _rebuild_task_sidebar's real-height stack;
         # disable the layout's own relayout so Qt never overrides them.
@@ -6594,13 +6638,21 @@ class CodecFoundryWindow(QMainWindow):
     def _cancel_session(self) -> None:
         # Stop dispatching new work first, then cancel every FFmpeg process,
         # sweep the controller again, and finally taskkill every PID this app
-        # ever spawned so nothing keeps encoding after "停止全部".
-        if self.scheduler is not None:
-            self.scheduler.request_shutdown()
-        if self.controller is not None:
-            self.controller.cancel()
-            self.controller.force_stop_all()
-        kill_all_app_processes()
+        # ever spawned so nothing keeps encoding after "停止全部".  The final
+        # sweeps live in a finally block: even if a cancellation step raises,
+        # the hard kill must still run.
+        try:
+            if self.scheduler is not None:
+                self.scheduler.request_shutdown()
+            if self.controller is not None:
+                try:
+                    self.controller.cancel()
+                except Exception as exc:
+                    self._log(f"[停止] 取消流程异常（{type(exc).__name__}），已强制清扫")
+        finally:
+            if self.controller is not None:
+                self.controller.force_stop_all()
+            kill_all_app_processes()
 
     def _reset_session_counters(self) -> None:
         self.total_equivalent_frames = 0.0
@@ -6715,6 +6767,15 @@ class CodecFoundryWindow(QMainWindow):
         self.task_widgets.clear()
         self.task_records.clear()
         self.waiting_order.clear()
+
+    def _on_task_host_resized(self) -> None:
+        """Splitter changed the sidebar width: restack cards to the new width."""
+        if not hasattr(self, "task_layout"):
+            return
+        drag_key = self._active_drag_key
+        self._rebuild_task_sidebar(
+            exclude_key=drag_key, insert_key=drag_key, animate=False
+        )
 
     def _rebuild_task_sidebar(
         self,

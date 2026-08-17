@@ -754,6 +754,102 @@ class GuiReorderTests(unittest.TestCase):
         finally:
             _close_window(window)
 
+    def test_cards_refit_width_when_sidebar_resizes(self):
+        # The sidebar layout is disabled, so a splitter drag must reflow the
+        # cards to the new width or they get clipped by the sidebar edge.
+        window = cf.CodecFoundryWindow()
+        try:
+            window.resize(1500, 900)
+            window.show()
+            cf.QApplication.instance().processEvents()
+            source = str(Path("D:/video/source.mp4"))
+            keys = []
+            for index in range(3):
+                record = {
+                    "source": source,
+                    "output": str(Path(f"D:/out/{index}.mp4")),
+                    "filename": f"f{index}.mp4",
+                }
+                window._create_task_card(0, record, "waiting")
+                keys.append(record["output"])
+            window.waiting_order = list(keys)
+            window._rebuild_task_sidebar(animate=False)
+            cf.QApplication.instance().processEvents()
+            host = window.task_host
+            frames = [window.task_widgets[k]["frame"] for k in keys]
+            before_width = host.width()
+            for frame in frames:
+                self.assertEqual(frame.width(), max(1, before_width))
+            left, sidebar = window.main_splitter.sizes()
+            window.main_splitter.setSizes([left - 120, sidebar + 120])
+            cf.QApplication.instance().processEvents()
+            cf.QApplication.instance().processEvents()
+            after_width = host.width()
+            self.assertGreater(after_width, before_width)
+            for frame in frames:
+                self.assertEqual(frame.width(), max(1, after_width))
+        finally:
+            _close_window(window)
+
+
+class StopSweepTests(unittest.TestCase):
+    """停止全部 must hard-kill everything even when a stop request raises."""
+
+    @unittest.skipUnless(os.name == "nt", "CTRL_BREAK quirk is Windows-only")
+    def test_request_stop_never_uses_ctrl_break_on_windows(self):
+        # On Windows CTRL_BREAK never reaches CREATE_NO_WINDOW children and
+        # raises SystemError from a console-less GUI; terminate() is the only
+        # reliable stop.
+        process = mock.Mock()
+        process.poll.return_value = None
+        process.send_signal.side_effect = SystemError("WinError 6 invalid handle")
+        cf.ProcessController._request_stop(process)
+        process.send_signal.assert_not_called()
+        process.terminate.assert_called_once()
+
+    def test_cancel_force_sweeps_even_when_stop_request_raises(self):
+        controller = cf.ProcessController()
+        first = mock.Mock()
+        first.pid = 101
+        first.poll.return_value = None
+        second = mock.Mock()
+        second.pid = 102
+        second.poll.return_value = None
+        controller.register(first, "a")
+        controller.register(second, "b")
+        with mock.patch.object(
+            controller, "_request_stop", side_effect=RuntimeError("boom")
+        ), mock.patch.object(controller, "_force_stop") as force:
+            controller.cancel(grace_seconds=0)
+        self.assertEqual(force.call_count, 2)
+
+    def test_cancel_task_force_sweeps_even_when_stop_request_raises(self):
+        controller = cf.ProcessController()
+        process = mock.Mock()
+        process.pid = 103
+        process.poll.return_value = None
+        controller.register(process, "a")
+        with mock.patch.object(
+            controller, "_request_stop", side_effect=RuntimeError("boom")
+        ), mock.patch.object(controller, "_force_stop") as force:
+            controller.cancel_task("a", grace_seconds=0)
+        self.assertEqual(force.call_count, 1)
+
+    def test_cancel_session_final_sweeps_run_when_cancel_raises(self):
+        window = cf.CodecFoundryWindow()
+        try:
+            window.controller = mock.Mock()
+            window.controller.cancel.side_effect = RuntimeError("boom")
+            window.scheduler = mock.Mock()
+            with mock.patch.object(cf, "kill_all_app_processes") as kill_all:
+                window._cancel_session()
+            kill_all.assert_called_once()
+            window.controller.cancel.assert_called_once()
+            window.controller.force_stop_all.assert_called_once()
+            window.scheduler.request_shutdown.assert_called_once()
+        finally:
+            _close_window(window)
+
     def test_ffmpeg_setup_window_shows_manual_buttons_on_failure(self):
         window = cf.FfmpegSetupWindow()
         try:
