@@ -4,12 +4,12 @@
     "latest_size": "53.3MB",
     "published": "2026-08-18",
     "notes": [
-        "1、实现单实例IPC，防止意外多开",
-        "2、允许拖拽实现调整任务顺序，增加UI动效",
-        "3、自动更新已上线",
-        "4、允许拖拽Resize窗口",
-        "5、失败任务可一键重试，禁用按钮显示灰态",
-        "6、修复了大量BUG...小鲸鱼辛苦了(CodeX配额烧干惹TwT)"
+        "实现单实例IPC，防止意外多开",
+        "允许拖拽实现调整任务顺序，增加UI动效",
+        "自动更新已上线",
+        "允许拖拽Resize窗口",
+        "失败任务可一键重试，禁用按钮显示灰态",
+        "修复了大量BUG...小鲸鱼辛苦了(CodeX配额烧干惹TwT)"
     ],
     "download_pages": [
         "https://gitee.com/otreee/CodecFoundry/releases/latest",
