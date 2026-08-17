@@ -1,18 +1,19 @@
 {
     "app": "CodecFoundry",
     "latest": "1.3.5",
-    "latest_size": "113.14MB",
+    "latest_size": "53.3MB",
     "published": "2026-08-18",
     "notes": [
-        "队列严格从上到下执行：任务卡原位更新状态，不再下沉到列表底部",
-        "修复“停止全部”残留进程：无控制台 GUI 下 CTRL_BREAK 抛 SystemError 中断取消流程",
-        "修复拖拽后任务卡互相嵌入：新重排赢过在途滑行 + 按真实控件高度堆叠",
-        "任务卡随分隔条拖动自适应宽度，不再被遮挡",
-        "失败任务可一键重试，禁用按钮显示灰态"
+        "1、实现单实例IPC，防止意外多开",
+        "2、允许拖拽实现调整任务顺序，增加UI动效",
+        "3、自动更新已上线",
+        "4、允许拖拽Resize窗口",
+        "5、失败任务可一键重试，禁用按钮显示灰态",
+        "6、修复了大量BUG...小鲸鱼辛苦了(CodeX配额烧干惹TwT)"
     ],
     "download_pages": [
         "https://gitee.com/otreee/CodecFoundry/releases/latest",
         "https://github.com/YCTS-otree/CodecFoundry/releases/latest"
     ],
-    "min_supported": "1.2.0"
+    "min_supported": "1.1.0"
 }
