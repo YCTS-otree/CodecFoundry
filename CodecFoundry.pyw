@@ -2772,8 +2772,10 @@ def main(
 
 
 from PySide6.QtCore import (
+    QEasingCurve,
     QEvent,
     QPoint,
+    QPropertyAnimation,
     QRect,
     Qt,
     QTimer,
@@ -3395,9 +3397,14 @@ def _install_from_source(
 
 
 def _probe_download_speed(
-    url: str, timeout: float = 30.0, cancel_event: threading.Event | None = None
+    url: str, timeout: float = 5.0, cancel_event: threading.Event | None = None
 ) -> float | None:
-    """Measure a source's early-transfer speed; None when unreachable."""
+    """Measure a source's early-transfer speed; None when unreachable.
+
+    The whole probe is capped at ``timeout`` seconds (default 5s) regardless of
+    how slowly the server streams, so source selection never delays the start
+    of the actual download for long.
+    """
     if cancel_event is not None and cancel_event.is_set():
         return None
     headers = {
@@ -3410,14 +3417,15 @@ def _probe_download_speed(
     if "gitee.com" in url:
         headers["Referer"] = "https://gitee.com/"
     started = time.monotonic()
+    deadline = started + max(1.0, timeout)
     try:
         request = Request(url, headers=headers)
         with urlopen(request, timeout=timeout) as response:
             total = 0
-            for _ in range(4):
+            while time.monotonic() < deadline:
                 if cancel_event is not None and cancel_event.is_set():
                     return None
-                chunk = response.read(256 * 1024)
+                chunk = response.read(64 * 1024)
                 if not chunk:
                     break
                 total += len(chunk)
@@ -3652,8 +3660,8 @@ RELEASE_INFO_URLS = [
     "https://api.github.com/repos/YCTS-otree/CodecFoundry/releases/latest",
     "https://gitee.com/api/v5/repos/otreee/CodecFoundry/releases/latest",
 ]
-UPDATE_HTTP_TIMEOUT = 4.0
-UPDATE_RELEASE_TIMEOUT = 8.0
+UPDATE_HTTP_TIMEOUT = 3.0
+UPDATE_RELEASE_TIMEOUT = 6.0
 UPDATE_USER_AGENT = f"CodecFoundry-Updater/{CODECFOUNDRY_VERSION}"
 FALLBACK_RELEASE_NOTES = "修复BUG"
 
@@ -4433,6 +4441,8 @@ QSplitter::handle {{ background: #353535; }}
 QLabel#statusBar {{ background: {COLOR_PURPLE}; color: white; padding: 0 9px; font-size: 8pt; }}
 QLabel#hint {{ color: {COLOR_MUTED}; font-size: 9pt; }}
 QLabel#cardTitle {{ font-weight: 600; }}
+QFrame#taskCard[dragging="true"] {{ border: 1px solid {COLOR_BLUE_HOVER}; }}
+QFrame#dropIndicator {{ background: {COLOR_BLUE_HOVER}; border: none; }}
 """
 
 
@@ -4676,7 +4686,12 @@ class TaskCardFrame(QFrame):
         self._drag_original_size = self.size()
         self.grabMouse()
         self.raise_()
-        self._set_scale(0.95, animated=True)
+        # Long-press feedback: shrink to 85%, highlight the border, grab cursor.
+        self._set_scale(0.85, animated=True)
+        self.setProperty("dragging", True)
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self.setCursor(Qt.CursorShape.ClosedHandCursor)
         self._autoscroll_timer.start()
         self._host_window.on_card_drag_started(self._task_key)
 
@@ -4723,6 +4738,10 @@ class TaskCardFrame(QFrame):
         self.releaseMouse()
         self._set_scale(1.0, animated=True)
         self._release_fixed_size()
+        self.setProperty("dragging", False)
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self.unsetCursor()
         if self._host_window is not None and self._task_key is not None:
             self._host_window.on_card_drag_finished(self._task_key)
 
@@ -5075,8 +5094,12 @@ class UpdateDialog(QDialog):
         notes_label.setWordWrap(True)
         notes_label.setStyleSheet("color: #d0d0d0;")
         notes_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        source_hint = QLabel("提示：国内网络建议优先使用 Gitee 源下载更新，速度更快更稳定。")
+        source_hint.setObjectName("hint")
+        source_hint.setWordWrap(True)
         layout.addWidget(notes_title)
         layout.addWidget(notes_label, 1)
+        layout.addWidget(source_hint)
 
         actions = QHBoxLayout()
         later = QPushButton("稍后")
@@ -5509,6 +5532,8 @@ class CodecFoundryWindow(QMainWindow):
         self._resize_start_geometry: QRect | None = None
         self._resize_start_global: QPoint | None = None
         self._sidebar_sizes_initialized = False
+        self._drop_indicator: QFrame | None = None
+        self._reflow_animations: dict[str, QPropertyAnimation] = {}
         app_instance = QApplication.instance()
         if app_instance is not None:
             app_instance.installEventFilter(self)
@@ -6640,10 +6665,25 @@ class CodecFoundryWindow(QMainWindow):
         self.task_records.clear()
         self.waiting_order.clear()
 
-    def _rebuild_task_sidebar(self, exclude_key: str | None = None) -> None:
-        """Lay cards out: waiting tasks first in queue order, then the rest."""
+    def _rebuild_task_sidebar(
+        self, exclude_key: str | None = None, insert_key: str | None = None
+    ) -> None:
+        """Lay cards out: waiting tasks first in queue order, then the rest.
+
+        During a drag, ``exclude_key`` removes the dragged card from the layout
+        and ``insert_key`` draws a highlighted line where it will be inserted;
+        the other cards glide to their new positions when the drag animation
+        setting is enabled.
+        """
         if not hasattr(self, "task_layout"):
             return
+        animate = bool(getattr(self, "drag_animation_enabled", True))
+        old_positions: dict[str, QPoint] = {}
+        if animate:
+            for key, widgets in self.task_widgets.items():
+                if key == exclude_key:
+                    continue
+                old_positions[key] = QPoint(widgets["frame"].pos())
         waiting_keys = [
             key
             for key in self.waiting_order
@@ -6659,7 +6699,48 @@ class CodecFoundryWindow(QMainWindow):
             self.task_layout.takeAt(0)
         for key in reversed(waiting_keys + other_keys):
             self.task_layout.insertWidget(0, self.task_widgets[key]["frame"])
+        if insert_key is not None and insert_key in self.waiting_order:
+            indicator = self._ensure_drop_indicator()
+            insert_index = self.waiting_order.index(insert_key)
+            self.task_layout.insertWidget(
+                min(insert_index, len(waiting_keys)), indicator
+            )
         self.task_layout.addStretch(1)
+        self.task_layout.activate()
+        if animate:
+            self._animate_reflow(old_positions)
+
+    def _ensure_drop_indicator(self) -> QFrame:
+        if self._drop_indicator is None:
+            indicator = QFrame()
+            indicator.setObjectName("dropIndicator")
+            indicator.setFixedHeight(3)
+            self._drop_indicator = indicator
+        return self._drop_indicator
+
+    def _animate_reflow(self, old_positions: dict[str, QPoint]) -> None:
+        """Glide cards from their previous to their new layout positions."""
+        for key, old_position in old_positions.items():
+            widgets = self.task_widgets.get(key)
+            if widgets is None:
+                continue
+            frame = widgets["frame"]
+            target = frame.pos()
+            if old_position == target:
+                continue
+            previous = self._reflow_animations.get(key)
+            if previous is not None:
+                previous.stop()
+            animation = QPropertyAnimation(frame, b"pos", self)
+            animation.setDuration(140)
+            animation.setStartValue(old_position)
+            animation.setEndValue(target)
+            animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+            animation.finished.connect(
+                lambda k=key: self._reflow_animations.pop(k, None)
+            )
+            animation.start(QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
+            self._reflow_animations[key] = animation
 
     # -- manual long-press drag coordination --------------------------------
 
@@ -6682,7 +6763,7 @@ class CodecFoundryWindow(QMainWindow):
         return True
 
     def on_card_drag_started(self, task_key: str) -> None:
-        self._rebuild_task_sidebar(exclude_key=task_key)
+        self._rebuild_task_sidebar(exclude_key=task_key, insert_key=task_key)
 
     def on_card_drag_moved(self, task_key: str, global_y: int) -> None:
         """Live-reorder around the dragged card (auto-avoid for the others)."""
@@ -6702,7 +6783,7 @@ class CodecFoundryWindow(QMainWindow):
             if task_key in self.waiting_order:
                 self.waiting_order.remove(task_key)
             self.waiting_order.insert(min(index, len(self.waiting_order)), task_key)
-            self._rebuild_task_sidebar(exclude_key=task_key)
+            self._rebuild_task_sidebar(exclude_key=task_key, insert_key=task_key)
 
     def on_card_drag_finished(self, task_key: str) -> None:
         """Insert the card at its release position and commit the new order."""
@@ -7416,7 +7497,8 @@ class CodecFoundryWindow(QMainWindow):
             "  4. 提供 CQ-VBR、实时进度、任务队列和安全退出保护\n"
             "  5. 支持直接拖入视频文件或文件夹\n"
             "  6. 单实例运行（可在设置关闭）：FlashCut 重复联动合并进现有编码队列\n"
-            "  7. 等待任务长按缩小 5% 动效拖拽排序（可关动效），队列自上而下执行\n"
+            "  7. 等待任务长按缩小 85% + 边框高亮 + 抓取光标拖拽排序，插入位置\n"
+            "     高亮线提示、其他卡片平滑避让（动效可在设置关闭），自上而下执行\n"
             "  8. 启动期 FFmpeg 专用窗口：双进度条 / 速度 / 剩余时间，支持托盘\n"
             "     “后台加载”，关闭窗口取消安装不留后台进程，可一键全局安装（UAC）\n"
             "  9. FFmpeg 自动检测与安装：复用 FlashCut / DJI DPVC，先测速选最快\n"
@@ -7474,7 +7556,8 @@ class CodecFoundryWindow(QMainWindow):
     def start_auto_update_check(self) -> None:
         if not self.check_update_on_startup:
             return
-        QTimer.singleShot(3000, lambda: self._run_update_check("auto"))
+        # Fire the background check immediately at startup.
+        QTimer.singleShot(300, lambda: self._run_update_check("auto"))
 
     def _run_update_check(self, mode: str) -> None:
         if self._update_check_running:
@@ -7522,7 +7605,7 @@ class CodecFoundryWindow(QMainWindow):
 
     def retry_ipc_claim(self) -> None:
         """Second chance to claim the instance slot once the event loop runs."""
-        if self.ipc_server is not None:
+        if self.ipc_server is not None or self.closing:
             return
         server, forwarded = acquire_single_instance(
             getattr(self, "startup_argv", [])
@@ -7594,6 +7677,9 @@ class CodecFoundryWindow(QMainWindow):
         self._handle_external_request(argv)
 
     def _activate_from_external(self) -> None:
+        if self.closing:
+            # A dying instance must never come back to the foreground.
+            return
         self._log("[单实例] 收到新启动请求，已激活现有窗口")
         if self.isMinimized():
             self.showNormal()
@@ -7684,15 +7770,30 @@ class CodecFoundryWindow(QMainWindow):
         self.start_button.setEnabled(False)
         if self.settings_window is not None:
             self.settings_window.close()
-        # Make the UI disappear immediately; cleanup continues safely in the
-        # existing event loop until every FFmpeg process and worker has stopped.
+        # Immediately release the single-instance slot: a quick relaunch must
+        # start a fresh instance instead of forwarding into this dying one.
+        if self.ipc_server is not None:
+            try:
+                self.ipc_server.close()
+                self.ipc_server.deleteLater()
+            except RuntimeError:
+                pass
+            self.ipc_server = None
+        # Last-resort watchdog: never leave a hidden, unclosable zombie behind.
+        self.exit_watchdog = QTimer(self)
+        self.exit_watchdog.setSingleShot(True)
+        self.exit_watchdog.setInterval(20000)
+        self.exit_watchdog.timeout.connect(lambda: os._exit(0))
+        self.exit_watchdog.start()
+        # Drop the topmost hint set for the confirmation box, then hide.
+        self._set_safe_exit_topmost(False)
         self.hide()
         if running:
             self._set_status("正在停止任务、释放资源并保存日志……")
             self.stop_all()
             self.close_timer.start()
         else:
-            self._finalize_close()
+            self._finish_close_when_ready()
 
     def _finish_close_when_ready(self) -> None:
         if self.worker and self.worker.is_alive():
@@ -7703,31 +7804,37 @@ class CodecFoundryWindow(QMainWindow):
     def _finalize_close(self) -> None:
         if self.close_finalized:
             return
-        set_output_callback(None)
-        set_event_callback(None)
-        application = QApplication.instance()
-        if application is not None:
-            try:
-                application.removeEventFilter(self)
-            except RuntimeError:
-                pass
-        if self.ipc_server is not None:
-            try:
-                self.ipc_server.close()
-                self.ipc_server.deleteLater()
-            except RuntimeError:
-                pass
-            self.ipc_server = None
-        self.log_saved_path = self._save_session_log()
-        self.app_logger.close()
-        self.close_finalized = True
-        self.close()
-        # The main window is deliberately hidden before cleanup.  Qt does not
-        # reliably emit lastWindowClosed when an already-hidden window closes,
-        # so explicitly stop the event loop after every resource is released.
-        application = QApplication.instance()
-        if application is not None:
-            application.quit()
+        try:
+            set_output_callback(None)
+            set_event_callback(None)
+            application = QApplication.instance()
+            if application is not None:
+                try:
+                    application.removeEventFilter(self)
+                except RuntimeError:
+                    pass
+            if self.ipc_server is not None:
+                try:
+                    self.ipc_server.close()
+                    self.ipc_server.deleteLater()
+                except RuntimeError:
+                    pass
+                self.ipc_server = None
+            self.log_saved_path = self._save_session_log()
+            self.app_logger.close()
+            self.close_finalized = True
+            self.close()
+        finally:
+            watchdog = getattr(self, "exit_watchdog", None)
+            if watchdog is not None:
+                watchdog.stop()
+            # The main window is deliberately hidden before cleanup.  Qt does
+            # not reliably emit lastWindowClosed when an already-hidden window
+            # closes, so explicitly stop the event loop after every resource
+            # is released.
+            application = QApplication.instance()
+            if application is not None:
+                application.quit()
 
 
 def run_ffmpeg_startup_phase() -> bool:

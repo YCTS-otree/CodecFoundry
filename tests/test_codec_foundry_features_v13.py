@@ -257,7 +257,7 @@ class FfmpegVersionTests(unittest.TestCase):
         speeds = {"github": 50 * 1024 * 1024, "gitee": 1024 * 1024}
         with mock.patch.object(
             cf, "_probe_download_speed",
-            side_effect=lambda url, timeout=30, cancel_event=None: speeds[
+            side_effect=lambda url, timeout=5.0, cancel_event=None: speeds[
                 "github" if "github" in url else "gitee"
             ],
         ):
@@ -863,6 +863,54 @@ class FramelessResizeTests(unittest.TestCase):
             window._apply_responsive_layout()
             self.assertEqual(list(window.main_splitter.sizes()), dragged_sizes)
             self.assertGreater(dragged_sizes[1], 360)
+        finally:
+            _close_window(window)
+
+    def test_safe_exit_releases_ipc_slot_and_starts_watchdog(self):
+        window = cf.CodecFoundryWindow()
+        try:
+            server = cf.QLocalServer()
+            server.listen("CodecFoundry-test-exit-" + str(os.getpid()))
+            window.ipc_server = server
+            window._begin_safe_exit(running=False)
+            self.assertTrue(window.closing)
+            self.assertIsNone(window.ipc_server)
+            self.assertFalse(server.isListening())
+            self.assertIsNotNone(getattr(window, "exit_watchdog", None))
+            self.assertTrue(window.close_finalized)
+        finally:
+            _close_window(window)
+
+    def test_external_activation_ignored_while_closing(self):
+        window = cf.CodecFoundryWindow()
+        try:
+            window.closing = True
+            window.hide()
+            window._activate_from_external()
+            self.assertFalse(window.isVisible())
+        finally:
+            _close_window(window)
+
+    def test_drop_indicator_shown_during_card_drag(self):
+        window = cf.CodecFoundryWindow()
+        try:
+            source = str(Path("D:/video/source.mp4"))
+            keys = []
+            for index in range(3):
+                record = {
+                    "source": source,
+                    "output": str(Path(f"D:/out/{index}.mp4")),
+                    "filename": f"f{index}.mp4",
+                }
+                window._create_task_card(0, record, "waiting")
+                keys.append(record["output"])
+            window.waiting_order = list(keys)
+            window.begin_card_drag(keys[0])
+            window.on_card_drag_started(keys[0])
+            self.assertIsNotNone(window._drop_indicator)
+            self.assertGreaterEqual(window.task_layout.indexOf(window._drop_indicator), 0)
+            window.on_card_drag_finished(keys[0])
+            self.assertEqual(window.task_layout.indexOf(window._drop_indicator), -1)
         finally:
             _close_window(window)
 
