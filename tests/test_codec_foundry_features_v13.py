@@ -804,6 +804,48 @@ class FramelessResizeTests(unittest.TestCase):
             window.close_finalized = True
             window.close()
 
+    def test_press_over_foreign_popup_does_not_start_resize(self):
+        window = cf.CodecFoundryWindow()
+        try:
+            window.resize(1000, 800)
+            window.show()
+            self.app.processEvents()
+            rect = window.geometry()
+            right_edge = window.mapToGlobal(cf.QPoint(rect.width() - 2, rect.height() // 2))
+            foreign = mock.Mock()
+            foreign.window.return_value = foreign  # a dialog, not our window
+            press = self._mouse_event(cf.QEvent.Type.MouseButtonPress, right_edge)
+            with mock.patch.object(cf.QApplication, "widgetAt", return_value=foreign):
+                self.assertFalse(window.eventFilter(window, press))
+            self.assertIsNone(window._resize_edge)
+        finally:
+            window.app_logger.close()
+            window.close_finalized = True
+            window.close()
+
+    def test_press_over_scrollbar_like_child_still_resizes(self):
+        # Even when a scrollbar sits under the right border, the press must
+        # start the resize (regression: right edge dead in the middle band).
+        window = cf.CodecFoundryWindow()
+        try:
+            window.resize(1400, 900)
+            window.show()
+            self.app.processEvents()
+            rect = window.geometry()
+            right_edge = window.mapToGlobal(cf.QPoint(rect.width() - 2, rect.height() // 2))
+            child = mock.Mock()
+            child.window.return_value = window  # any child of the main window
+            press = self._mouse_event(cf.QEvent.Type.MouseButtonPress, right_edge)
+            with mock.patch.object(cf.QApplication, "widgetAt", return_value=child):
+                self.assertTrue(window.eventFilter(window, press))
+            self.assertEqual(window._resize_edge, "r")
+            release = self._mouse_event(cf.QEvent.Type.MouseButtonRelease, right_edge)
+            window.eventFilter(window, release)
+        finally:
+            window.app_logger.close()
+            window.close_finalized = True
+            window.close()
+
 
 if __name__ == "__main__":
     unittest.main()

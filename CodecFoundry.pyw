@@ -5572,7 +5572,6 @@ class CodecFoundryWindow(QMainWindow):
         self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
         self.main_splitter.setChildrenCollapsible(False)
         self.main_splitter.setHandleWidth(6)
-        self.main_splitter.setCursor(Qt.CursorShape.SizeHorCursor)
         body_layout.addWidget(self.main_splitter, 1)
 
         self.left_shell = QWidget()
@@ -6014,9 +6013,13 @@ class CodecFoundryWindow(QMainWindow):
         """Frameless window: resize via a 3px border on all four edges/corners.
 
         Everything works in Qt logical coordinates, so DPI scaling can never
-        shift the hit zone away from the visible window border.
+        shift the hit zone away from the visible window border.  The handler
+        does not depend on which child widget received the event: any mouse
+        event whose global position falls inside this window's rectangle is
+        eligible, which keeps the right border working even when it is covered
+        by scrollbars or the task sidebar.
         """
-        if self.close_finalized or self.closing:
+        if getattr(self, "close_finalized", False) or getattr(self, "closing", False):
             return super().eventFilter(watched, event)
         event_type = event.type()
         if event_type not in (
@@ -6025,8 +6028,6 @@ class CodecFoundryWindow(QMainWindow):
             QEvent.Type.MouseButtonRelease,
         ):
             return super().eventFilter(watched, event)
-        if not isinstance(watched, QWidget) or watched.window() is not self:
-            return super().eventFilter(watched, event)
         if event_type == QEvent.Type.MouseButtonPress:
             if (
                 event.button() == Qt.MouseButton.LeftButton
@@ -6034,18 +6035,23 @@ class CodecFoundryWindow(QMainWindow):
                 and not self.isFullScreen()
             ):
                 global_position = event.globalPosition().toPoint()
-                edge = self._resize_edge_at(self.mapFromGlobal(global_position))
-                if edge:
-                    self._resize_edge = edge
-                    self._resize_start_geometry = QRect(self.geometry())
-                    self._resize_start_global = global_position
-                    return True
+                if self._position_belongs_to_window(global_position):
+                    edge = self._resize_edge_at(
+                        self.mapFromGlobal(global_position)
+                    )
+                    if edge:
+                        self._resize_edge = edge
+                        self._resize_start_geometry = QRect(self.geometry())
+                        self._resize_start_global = global_position
+                        return True
         elif event_type == QEvent.Type.MouseMove:
             if self._resize_edge:
                 self._apply_resize_delta(event.globalPosition().toPoint())
                 return True
             if not event.buttons():
-                self._update_resize_cursor(event.globalPosition().toPoint())
+                global_position = event.globalPosition().toPoint()
+                if self._position_belongs_to_window(global_position):
+                    self._update_resize_cursor(global_position)
         elif event_type == QEvent.Type.MouseButtonRelease:
             if self._resize_edge and event.button() == Qt.MouseButton.LeftButton:
                 self._resize_edge = None
@@ -6054,6 +6060,13 @@ class CodecFoundryWindow(QMainWindow):
                 self.unsetCursor()
                 return True
         return super().eventFilter(watched, event)
+
+    def _position_belongs_to_window(self, global_position: QPoint) -> bool:
+        """True when the position is over this window and not a popup above it."""
+        if not self.frameGeometry().contains(global_position):
+            return False
+        top_widget = QApplication.widgetAt(global_position)
+        return top_widget is None or top_widget.window() is self
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
