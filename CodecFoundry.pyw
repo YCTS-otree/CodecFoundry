@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CodecFoundry v1.3.2-beta: single-file PySide6 NVENC transcoder.
+"""CodecFoundry v1.3.5: single-file PySide6 NVENC transcoder.
 
 The backend and desktop UI intentionally live in this one source file.  The GPU
 capability database remains external data: driver/runtime discovery tells us which
@@ -119,7 +119,7 @@ VIDEO_EXTENSIONS = {
     ".3gp", ".avi", ".flv", ".m2ts", ".m4v", ".mkv", ".mov", ".mp4",
     ".mpeg", ".mpg", ".mts", ".ts", ".webm", ".wmv",
 }
-CODECFOUNDRY_VERSION = "1.3.2-beta"
+CODECFOUNDRY_VERSION = "1.3.5"
 HLM_FORMAT = "FlashCut Highlight Markers"
 SUPPORTED_HLM_VERSION = 2
 CODEC_ALIASES = {
@@ -7151,7 +7151,6 @@ class CodecFoundryWindow(QMainWindow):
         if not widgets or record is None:
             return
         previous_status = str(record.get("status") or "")
-        was_waiting = previous_status == "waiting"
         labels = {
             "waiting": ("等待中", COLOR_WAITING),
             "running": ("进行中", COLOR_RUNNING),
@@ -7207,12 +7206,12 @@ class CodecFoundryWindow(QMainWindow):
             widgets["after"].show()
         if isinstance(widgets["frame"], TaskCardFrame):
             widgets["frame"].set_draggable(status == "waiting")
-        if was_waiting and status != "waiting" and task_key in self.waiting_order:
-            self.waiting_order.remove(task_key)
-            self._rebuild_task_sidebar(exclude_key=self._active_drag_key, animate=False)
-        elif previous_status != status:
+        if previous_status != status:
             # A card's height changes with its status (e.g. the "完成" summary
             # appears): recompute the layout immediately so cards never overlap.
+            # The card KEEPS its queue position (it is not removed from the
+            # list): this is what makes the batch visibly execute top-to-bottom
+            # instead of running cards sinking to the bottom of the sidebar.
             self._rebuild_task_sidebar(exclude_key=self._active_drag_key, animate=False)
         self._update_retry_all_button()
 

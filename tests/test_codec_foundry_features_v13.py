@@ -546,9 +546,46 @@ class SchedulerReorderTests(unittest.TestCase):
             )
             # Immediate relayout: no glide animations are started.
             self.assertEqual(window._reflow_animations, {})
+            # Finished cards KEEP their queue position so the batch visibly
+            # executes top-to-bottom (they must not sink below the waiting ones).
             self.assertEqual(
-                list(window.waiting_order), [second["output"]]
+                list(window.waiting_order),
+                [first["output"], second["output"]],
             )
+            first_frame = window.task_widgets[first["output"]]["frame"]
+            second_frame = window.task_widgets[second["output"]]["frame"]
+            self.assertLess(first_frame.y(), second_frame.y())
+        finally:
+            _close_window(window)
+
+    def test_running_card_keeps_its_top_position(self):
+        # The top card starts transcoding IN PLACE: the list executes visibly
+        # top-to-bottom instead of the running card jumping to the bottom.
+        window = cf.CodecFoundryWindow()
+        try:
+            source = str(Path("D:/video/source.mp4"))
+            keys = []
+            for index in range(3):
+                record = {
+                    "source": source,
+                    "output": str(Path(f"D:/out/{index}.mp4")),
+                    "filename": f"f{index}.mp4",
+                }
+                window._create_task_card(0, record, "waiting")
+                keys.append(record["output"])
+            window.waiting_order = list(keys)
+            window._rebuild_task_sidebar(animate=False)
+            cf.QApplication.instance().processEvents()
+            frames = [window.task_widgets[k]["frame"] for k in keys]
+            self.assertEqual([f.y() for f in frames], sorted(f.y() for f in frames))
+            window._update_task_card(keys[0], "running", 0)
+            self.assertEqual(window.waiting_order, keys)
+            self.assertLess(frames[0].y(), frames[1].y())
+            self.assertLess(frames[1].y(), frames[2].y())
+            window._update_task_card(keys[0], "success", 0,
+                                     {"input_size": 1000, "output_size": 500})
+            self.assertEqual(window.waiting_order, keys)
+            self.assertLess(frames[0].y(), frames[1].y())
         finally:
             _close_window(window)
 
