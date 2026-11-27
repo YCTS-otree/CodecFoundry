@@ -410,6 +410,10 @@ class UpdateFallbackTests(unittest.TestCase):
 
 
 class SchedulerReorderTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = cf.QApplication.instance() or cf.QApplication([])
+
     def setUp(self):
         self.scheduler = cf.LiveScheduler(cf.ProcessController())
 
@@ -933,7 +937,8 @@ class StopSweepTests(unittest.TestCase):
             data_dir = Path(temp_dir) / "data"
             data_dir.mkdir()
             (data_dir / "settings.json").write_text(
-                json.dumps({"single_instance": False}), encoding="utf-8"
+                json.dumps({"config_version": "1.3.7", "single_instance": False}),
+                encoding="utf-8",
             )
             with mock.patch.object(cf, "APP_SETTINGS_PATH", data_dir / "settings.json"):
                 self.assertFalse(cf.single_instance_preferred())
@@ -1187,6 +1192,269 @@ class FramelessResizeTests(unittest.TestCase):
                 window.task_records[failed_record["output"]]["status"], "waiting"
             )
             self.assertTrue(launch.called)
+        finally:
+            _close_window(window)
+
+
+class EngineQueueRegressionTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = cf.QApplication.instance() or cf.QApplication([])
+
+    def test_nine_videos_have_nine_total_assignments_and_completed_queues(self):
+        window = cf.CodecFoundryWindow()
+        scheduler = cf.LiveScheduler(cf.ProcessController())
+        gpu = cf.GpuCapability(0, "GPU", 4, frozenset({"hevc"}), frozenset({"hevc"}))
+        tasks = [make_task(f"queue-{index}.mp4") for index in range(9)]
+        plan = cf.JobPlan(tasks, [], tasks, make_settings(), [gpu], None, "hevc", "mp4")
+        args = cf.argparse.Namespace(
+            ffmpeg="ffmpeg", ffprobe="ffprobe", no_cpu_affinity=False,
+            no_software_fallback=False, debug_progress=False,
+        )
+        events = []
+
+        def receive(kind, payload):
+            events.append((kind, dict(payload)))
+            window._handle_backend_event(kind, payload)
+
+        cf.set_event_callback(receive)
+        try:
+            scheduler._append_request_locked(plan, args, fresh=True)
+            self.assertEqual(sum(s["queue_total"] for s in window.slot_states.values()), 9)
+            self.assertEqual(sorted(s["queue_total"] for s in window.slot_states.values()), [2, 2, 2, 3])
+            # Force a free engine to take another engine's planned task.
+            first = scheduler.waiting[0]
+            first.preferred_slot = 3
+            with mock.patch.object(cf.threading.Thread, "start"):
+                scheduler.dispatch()
+            self.assertEqual(first.preferred_slot, 0)
+            self.assertEqual(sum(s["queue_total"] for s in window.slot_states.values()), 9)
+
+            def complete(slot, task, settings, view, *args, finish_hook, **kwargs):
+                output = str(task.output)
+                work = cf.task_equivalent_frames(task, settings)
+                cf.emit_event("task_start", slot_id=slot.slot_id, output=output,
+                              filename=task.source.name, equivalent_frames=work,
+                              queue_total=9, completed_equivalent_frames=scheduler.completed_work)
+                completed, remaining = finish_hook("success")
+                cf.emit_event("task_done", slot_id=slot.slot_id, output=output,
+                              status="success", completed_equivalent_frames=completed)
+                return task, True, "校验通过"
+
+            with mock.patch.object(cf, "encode_task", side_effect=complete):
+                while scheduler.busy or scheduler.waiting:
+                    for slot_id, item in list(scheduler.busy.items()):
+                        slot = next(s for s in scheduler.slots if s.slot_id == slot_id)
+                        scheduler._worker_thread(slot, item)
+                    with mock.patch.object(cf.threading.Thread, "start"):
+                        scheduler.dispatch()
+            self.assertEqual(sum(s["completed_count"] for s in window.slot_states.values()), 9)
+            for slot_id, state in window.slot_states.items():
+                self.assertEqual(state["completed_count"], state["queue_total"])
+                self.assertEqual(window.slot_widgets[slot_id]["queue"].value(), 1000)
+                self.assertIn("100.0% · ETA 00:00:00", window.slot_widgets[slot_id]["queue_text"].text())
+        finally:
+            cf.set_event_callback(None)
+            _close_window(window)
+
+    def test_engine_progress_and_eta_ignore_other_engines(self):
+        window = cf.CodecFoundryWindow()
+        try:
+            window._ensure_slot_cards(2)
+            window.session_completed_equivalent = 9000
+            window.session_completed_count = 8
+            window.session_total_count = 9
+            state = window.slot_states[0]
+            state.update(queue_total=2, completed_count=1, queue_equivalent=200,
+                         completed_equivalent=100, current_equivalent=100,
+                         progress=0.5, equivalent_fps=10, active=True)
+            window.slot_states[1].update(equivalent_fps=1000, active=True)
+            window._update_slot_queue(0)
+            self.assertEqual(window.slot_widgets[0]["queue_text"].text(),
+                             "队列 1/2 · 75.0% · ETA 00:00:05")
+        finally:
+            _close_window(window)
+
+    def test_idle_scheduler_exit_uses_normal_confirmation_and_shuts_down(self):
+        window = cf.CodecFoundryWindow()
+        worker = mock.Mock()
+        worker.is_alive.return_value = True
+        window.worker = worker
+        window.scheduler = cf.LiveScheduler(cf.ProcessController())
+        window.intake_queue = cf.queue.Queue()
+        window.start_button.setEnabled(True)
+        try:
+            self.assertFalse(window._has_active_tasks())
+            with mock.patch.object(cf, "QMessageBox") as message_box, \
+                 mock.patch.object(window, "_set_safe_exit_topmost"):
+                window.closeEvent(mock.Mock())
+                message_box.return_value.setText.assert_called_once_with("确定退出 CodecFoundry 吗？")
+            window.active_slot_files[0] = "正在校验的视频.mp4"
+            self.assertTrue(window._has_active_tasks())
+            with mock.patch.object(cf, "QMessageBox") as message_box, \
+                 mock.patch.object(window, "_set_safe_exit_topmost"):
+                window.closeEvent(mock.Mock())
+                message_box.return_value.setText.assert_called_once_with("编码或校验任务仍在运行。")
+            window.active_slot_files.clear()
+            window.intake_queue.put(cf.SchedulerRequest([], fresh=True))
+            self.assertTrue(window._has_active_tasks())
+            window.intake_queue.get_nowait()
+            window.start_button.setEnabled(False)  # Planning or saving the report.
+            self.assertTrue(window._has_active_tasks())
+            window.start_button.setEnabled(True)
+            with mock.patch.object(window, "_set_safe_exit_topmost"):
+                window._begin_safe_exit(running=False)
+            self.assertTrue(window.scheduler.shutdown)
+            self.assertTrue(window.close_timer.isActive())
+            worker.is_alive.return_value = False
+            window._finish_close_when_ready()
+            self.assertTrue(window.close_finalized)
+        finally:
+            window.close_timer.stop()
+            if getattr(window, "exit_watchdog", None):
+                window.exit_watchdog.stop()
+            window.worker = None
+            _close_window(window)
+
+
+class NonStrictValidationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = cf.QApplication.instance() or cf.QApplication([])
+
+    def test_failed_validation_keep_delete_and_strict_preserve_source(self):
+        for enabled, choice in ((False, "keep"), (True, "keep"), (True, "delete")):
+            with self.subTest(enabled=enabled, choice=choice), tempfile.TemporaryDirectory() as folder:
+                source, output = Path(folder) / "source.mp4", Path(folder) / "output.mp4"
+                source.write_bytes(b"original-video" * 10)
+                output.write_bytes(b"encoded-video")
+                task = cf.VideoTask(source, output, cf.VideoInfo("hevc", 1920, 1080, 30, duration=1, frame_count=30))
+                settings = cf.replace(make_settings(), non_strict_validation=enabled)
+                gpu = cf.GpuCapability(0, "GPU", 1, frozenset({"hevc"}), frozenset({"hevc"}))
+                slot = cf.EncoderSlot(gpu, 0, slot_id=0, codec="hevc")
+                events = []
+
+                def receive(kind, payload):
+                    events.append((kind, payload))
+                    if kind == "validation_review":
+                        payload["response_queue"].put(choice)
+
+                cf.set_event_callback(receive)
+                try:
+                    with mock.patch.object(cf, "run_ffmpeg", return_value=(0, "")), \
+                         mock.patch.object(cf, "validate_existing_output", return_value=(False, "帧率不一致")), \
+                         mock.patch.object(cf, "probe_video", return_value=cf.VideoInfo("av1", 1280, 720, 24, duration=0.9, frame_count=22)):
+                        result = cf.encode_task(slot, task, settings, cf.QueueView(0, 1, 30, 0),
+                                                "ffmpeg", False, False, cf.ProcessController())
+                    retained = enabled and choice == "keep"
+                    self.assertEqual(output.exists(), retained)
+                    self.assertEqual(source.read_bytes(), b"original-video" * 10)
+                    self.assertFalse(result[1])
+                    done = [p for k, p in events if k == "task_done"][-1]
+                    self.assertEqual(done["status"], "failed")
+                    self.assertEqual(done["retained_output"], retained)
+                    reviews = [p for k, p in events if k == "validation_review"]
+                    self.assertEqual(len(reviews), int(enabled))
+                    if enabled:
+                        for pair in ("HEVC → AV1", "1920x1080 → 1280x720", "30 fps → 24 fps", "1.000 秒 → 0.900 秒"):
+                            self.assertIn(pair, reviews[0]["difference"])
+                    if retained:
+                        report = cf.build_compression_report([task], [result], settings, cf.datetime.now(), cf.datetime.now())
+                        self.assertIn("用户选择保留", report)
+                        self.assertIn("成功：0", report)
+                finally:
+                    cf.set_event_callback(None)
+
+    def test_waiting_for_decision_can_be_cancelled(self):
+        controller = cf.ProcessController()
+        task = make_task("cancel-review.mp4")
+        received = cf.threading.Event()
+        cf.set_event_callback(lambda *args: received.set())
+        result = []
+        try:
+            with mock.patch.object(cf, "describe_validation_difference", return_value="时长不一致"):
+                worker = cf.threading.Thread(target=lambda: result.append(cf.request_output_retention(
+                    task, make_settings(), "ffprobe", "时长不一致", controller)))
+                worker.start()
+                self.assertTrue(received.wait(1))
+                controller.cancel_event.set()
+                worker.join(2)
+                self.assertFalse(worker.is_alive())
+                self.assertEqual(result, [False])
+        finally:
+            controller.cancel_event.set()
+            cf.set_event_callback(None)
+
+    def test_settings_persist_and_build_non_strict_request(self):
+        window = cf.CodecFoundryWindow()
+        dialog = cf.SettingsDialog(window)
+        try:
+            self.assertTrue(cf.DEFAULT_PREFERENCES["non_strict_validation"])
+            dialog.non_strict_check.setChecked(True)
+            with mock.patch.object(window, "_save_preferences", return_value=True):
+                window.apply_settings_dialog(dialog)
+            self.assertTrue(window.non_strict_validation)
+            window.input_list.addItem("D:/source.mp4")
+            self.assertIn("--non-strict-validation", window._validate_and_build_args())
+            with tempfile.TemporaryDirectory() as folder, \
+                 mock.patch.object(cf, "APP_SETTINGS_PATH", Path(folder) / "settings.json"):
+                cf._write_preferences_document(window._collect_preferences())
+                self.assertTrue(cf.load_app_preferences()["non_strict_validation"])
+            dialog._restore_defaults()
+            self.assertTrue(dialog.non_strict_check.isChecked())
+        finally:
+            dialog.close()
+            _close_window(window)
+
+    def test_stop_dismisses_open_review(self):
+        window = cf.CodecFoundryWindow()
+        response = cf.queue.Queue()
+        controller = cf.ProcessController()
+        try:
+            cf.QTimer.singleShot(0, controller.cancel_event.set)
+            window._handle_validation_review(dict(
+                output="D:/out/stopped.mp4", difference="GPU 解码失败",
+                response_queue=response, controller=controller,
+            ))
+            self.assertEqual(response.get_nowait(), "delete")
+            self.assertFalse(window._validation_review_active)
+        finally:
+            _close_window(window)
+
+    def test_concurrent_reviews_are_serialized_and_card_warns_when_retained(self):
+        window = cf.CodecFoundryWindow()
+        first, second = cf.queue.Queue(), cf.queue.Queue()
+        controller = cf.ProcessController()
+        one = dict(output="D:/out/one.mp4", difference="帧率：30 → 24", response_queue=first, controller=controller)
+        two = dict(output="D:/out/two.mp4", difference="时长不一致", response_queue=second, controller=controller)
+        seen = []
+
+        def choose():
+            box = self.app.activeModalWidget()
+            seen.append(box.text())
+            if len(seen) == 1:
+                window._handle_validation_review(two)
+                button = next(b for b in box.buttons() if b.text() == "保留输出文件")
+                cf.QTimer.singleShot(0, choose)
+            else:
+                button = next(b for b in box.buttons() if b.text() == "删除输出文件")
+            button.click()
+
+        try:
+            cf.QTimer.singleShot(0, choose)
+            window._handle_validation_review(one)
+            self.assertEqual(first.get_nowait(), "keep")
+            self.assertEqual(second.get_nowait(), "delete")
+            self.assertEqual(len(seen), 2)
+            self.assertFalse(window._validation_review_active)
+            record = dict(source="D:/src/one.mp4", output=one["output"], filename="one.mp4")
+            window._create_task_card(0, record, "waiting")
+            window._update_task_card(one["output"], "failed", 0,
+                                     dict(retained_output=True, error="校验未通过；用户选择保留"))
+            widgets = window.task_widgets[one["output"]]
+            self.assertEqual(widgets["status"].text(), "已保留 · 校验未通过")
+            self.assertEqual(widgets["action"].text(), "打开")
+            self.assertNotIn("校验通过", widgets["after"].text())
         finally:
             _close_window(window)
 

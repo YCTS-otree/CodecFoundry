@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CodecFoundry v1.3.5: single-file PySide6 NVENC transcoder.
+"""CodecFoundry v1.4.1-Beta: single-file PySide6 NVENC transcoder.
 
 The backend and desktop UI intentionally live in this one source file.  The GPU
 capability database remains external data: driver/runtime discovery tells us which
@@ -12,7 +12,9 @@ from __future__ import annotations
 import argparse
 import csv
 import ctypes
+import errno
 from ctypes import wintypes
+from difflib import SequenceMatcher
 import hashlib
 import io
 import json
@@ -119,7 +121,10 @@ VIDEO_EXTENSIONS = {
     ".3gp", ".avi", ".flv", ".m2ts", ".m4v", ".mkv", ".mov", ".mp4",
     ".mpeg", ".mpg", ".mts", ".ts", ".webm", ".wmv",
 }
-CODECFOUNDRY_VERSION = "1.3.5"
+CODECFOUNDRY_VERSION = "1.4.1-Beta"
+PREFERENCES_FORMAT_VERSION = "1.3.7"
+MIN_PREFERENCES_FORMAT_VERSION = (1, 3, 7, 0)
+HEVC_TO_AV1_CQ_RATIO = 1.235
 HLM_FORMAT = "FlashCut Highlight Markers"
 SUPPORTED_HLM_VERSION = 2
 CODEC_ALIASES = {
@@ -134,6 +139,7 @@ CODEC_ALIASES = {
 PRINT_LOCK = threading.Lock()
 OUTPUT_CALLBACK = None
 EVENT_CALLBACK = None
+UNREADABLE_INPUT_CALLBACK = None
 REFERENCE_PIXELS = 1920 * 1080
 
 # Every FFmpeg/ffprobe PID this process ever spawned.  Used as a last-resort
@@ -170,6 +176,10 @@ def kill_all_app_processes() -> None:
 
 class TranscodeError(RuntimeError):
     """An expected configuration, probing, or transcoding error."""
+
+
+class InputPlanningPaused(TranscodeError):
+    """The operator paused planning after an unreadable input was found."""
 
 
 def run_captured_text(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
@@ -275,6 +285,8 @@ class EncodeSettings:
     multipass: str
     overwrite: bool
     copy_subtitles: bool
+    prefer_smaller_output: bool = True
+    non_strict_validation: bool = False
 
 
 class ProcessController:
@@ -454,6 +466,12 @@ def set_event_callback(callback) -> None:
     EVENT_CALLBACK = callback
 
 
+def set_unreadable_input_callback(callback) -> None:
+    """Install the GUI-only synchronous decision bridge for bad source files."""
+    global UNREADABLE_INPUT_CALLBACK
+    UNREADABLE_INPUT_CALLBACK = callback
+
+
 def emit_event(event_type: str, **payload: object) -> None:
     if EVENT_CALLBACK is None:
         return
@@ -462,6 +480,24 @@ def emit_event(event_type: str, **payload: object) -> None:
     except Exception:
         # A presentation callback must never break an encode.
         pass
+
+
+def request_unreadable_input_decision(
+    path: Path,
+    error: str,
+    controller: ProcessController | None = None,
+) -> str:
+    """Block planning until the GUI chooses pause or skip.
+
+    The callback is deliberately separate from ordinary event delivery so test
+    collectors and CLI runs can never block waiting for a response they cannot
+    provide.
+    """
+    callback = UNREADABLE_INPUT_CALLBACK
+    if callback is None:
+        raise TranscodeError(error)
+    decision = str(callback(path, error, controller) or "pause").casefold()
+    return "skip" if decision == "skip" else "pause"
 
 
 def warn(message: str) -> None:
@@ -592,8 +628,40 @@ def validate_configured_gpus(
                 or actual_normalized in normalized_name(gpu.name)
             ]
             matches = partial if len(partial) == 1 else []
+        if not matches and configured:
+            actual_normalized = normalized_name(actual_name)
+            actual_models = set(re.findall(r"\d{3,4}", actual_normalized))
+            ranked: list[tuple[float, GpuCapability]] = []
+            for gpu in configured:
+                candidate = normalized_name(gpu.name)
+                candidate_models = set(re.findall(r"\d{3,4}", candidate))
+                model_bonus = 0.35 if actual_models and actual_models == candidate_models else 0.0
+                score = SequenceMatcher(None, actual_normalized, candidate).ratio() + model_bonus
+                ranked.append((score, gpu))
+            ranked.sort(key=lambda item: item[0], reverse=True)
+            if ranked and ranked[0][0] >= 0.72:
+                matches = [ranked[0][1]]
+                warn(
+                    f"实际 GPU {actual_index}（{actual_name}）未精确收录，"
+                    f"暂按最相近型号“{ranked[0][1].name}”尝试"
+                )
         if not matches:
-            warn(f"实际 GPU {actual_index}（{actual_name}）在能力字典中没有唯一匹配项")
+            warn(
+                f"实际 GPU {actual_index}（{actual_name}）在能力字典中无相近型号，"
+                "将先尝试 GPU；硬件解码失败时自动降级为 CPU 解码"
+            )
+            usable.append(
+                GpuCapability(
+                    index=actual_index,
+                    name=actual_name,
+                    encoder_engines=1,
+                    encode=frozenset({"hevc", "av1"}),
+                    decode=frozenset({
+                        "h264", "hevc", "av1", "vp8", "vp9", "mpeg1", "mpeg2", "vc1"
+                    }),
+                    uuid=actual_uuid,
+                )
+            )
             continue
         if len(matches) > 1:
             raise TranscodeError(f"GPU 型号“{actual_name}”在能力字典中重复")
@@ -1128,6 +1196,57 @@ def validate_existing_output(
     return False, f"所有可用 GPU 均无法完整解码视频流：{last_error}"
 
 
+def describe_validation_difference(
+    task: VideoTask, settings: EncodeSettings, ffprobe: str, reason: str
+) -> str:
+    """Show every metadata difference even when validation stopped at the first."""
+    width, height = settings.resolution or (task.info.width, task.info.height)
+    fps = settings.fps_value or task.info.fps
+    lines = [f"校验失败原因：{reason}", "", "项目：期望 → 实际"]
+    try:
+        actual = probe_video(task.output, ffprobe)
+    except (TranscodeError, OSError) as exc:
+        lines.append(f"无法读取输出视频信息：{exc}")
+    else:
+        def frame_rate(value):
+            return f"{value:g} fps" if value else "未知"
+
+        def duration(value):
+            return f"{value:.3f} 秒" if value is not None else "未知"
+
+        lines.extend([
+            f"编码格式：{settings.codec.upper()} → {actual.codec.upper()}",
+            f"分辨率：{width}x{height} → {actual.width}x{actual.height}",
+            f"帧率：{frame_rate(fps)} → {frame_rate(actual.fps)}",
+            f"时长：{duration(task.info.duration)} → {duration(actual.duration)}",
+        ])
+    return "\n".join(lines)
+
+
+def request_output_retention(
+    task: VideoTask, settings: EncodeSettings, ffprobe: str,
+    reason: str, controller: ProcessController,
+) -> bool:
+    """Wait for the GUI decision without preventing stop/pause/exit."""
+    if EVENT_CALLBACK is None:
+        return False
+    response: queue.Queue[str] = queue.Queue(maxsize=1)
+    task_key = str(task.output)
+    emit_event(
+        "validation_review", source=str(task.source), output=task_key,
+        difference=describe_validation_difference(task, settings, ffprobe, reason),
+        response_queue=response, controller=controller,
+    )
+    while not controller.cancelled and not controller.task_cancelled(task_key):
+        if EVENT_CALLBACK is None:
+            return False
+        try:
+            return response.get(timeout=0.25) == "keep"
+        except queue.Empty:
+            continue
+    return False
+
+
 def make_tasks(
     inputs: Sequence[Path],
     output_dir: Path | None,
@@ -1155,12 +1274,39 @@ def make_tasks(
             filename=source.name,
             stage="正在探测源视频",
         )
-        info = probe_video(source, ffprobe)
         output = output_for(source, output_dir, codec, container)
-        output.parent.mkdir(parents=True, exist_ok=True)
         if output in outputs:
             raise TranscodeError(f"多个输入会生成同一个输出：{output}")
         outputs.add(output)
+        try:
+            info = probe_video(source, ffprobe)
+        except TranscodeError as exc:
+            detail = str(exc)
+            decision = request_unreadable_input_decision(source, detail, controller)
+            if decision == "pause":
+                raise InputPlanningPaused(
+                    f"已暂停：源视频无法读取：{source}"
+                ) from exc
+            skip_reason = f"源视频无法读取，已按用户选择跳过：{detail}"
+            warn(f"[跳过] {source.name}：{skip_reason}")
+            tasks.append(
+                VideoTask(
+                    source=source,
+                    output=output,
+                    info=VideoInfo("unknown", 0, 0, None),
+                    skip_reason=skip_reason,
+                )
+            )
+            emit_event(
+                "probe_progress",
+                progress=(source_index + 1) / input_count if input_count else 1.0,
+                current=source_index + 1,
+                total=input_count,
+                filename=source.name,
+                stage="源视频损坏 / 不可读，已跳过",
+            )
+            continue
+        output.parent.mkdir(parents=True, exist_ok=True)
         skip_reason: str | None = None
         overwrite_existing = False
         replacement_reason: str | None = None
@@ -1371,18 +1517,36 @@ def verify_ffmpeg_encoder(ffmpeg: str, codec: str) -> None:
         raise TranscodeError(f"当前 FFmpeg 没有 {encoder} 编码器")
 
 
-def create_slots(gpus: Sequence[GpuCapability], codec: str) -> list[EncoderSlot]:
+def create_slots(
+    gpus: Sequence[GpuCapability],
+    codec: str,
+    hyperthread_enabled: bool = False,
+    hyperthread_mode: str = "multiplier",
+    hyperthread_extra: int = 1,
+) -> list[EncoderSlot]:
     eligible = [gpu for gpu in gpus if gpu.can_encode(codec)]
     if not eligible:
         details = "; ".join(
             f"GPU {gpu.index} {gpu.name}: {','.join(sorted(gpu.encode)) or '无'}" for gpu in gpus
         )
         raise TranscodeError(f"所选 {codec.upper()} 硬件编码不受任何可用 GPU 支持。配置情况：{details}")
-    return [
-        EncoderSlot(gpu=gpu, engine=engine, codec=codec)
-        for gpu in eligible
-        for engine in range(gpu.encoder_engines)
-    ]
+    slots: list[EncoderSlot] = []
+    for gpu in eligible:
+        slot_count = gpu.encoder_engines
+        if hyperthread_enabled:
+            if hyperthread_mode == "multiplier":
+                slot_count *= 2
+            else:
+                slot_count += max(1, min(4, int(hyperthread_extra)))
+        slots.extend(
+            EncoderSlot(
+                gpu=gpu,
+                engine=slot_index % gpu.encoder_engines,
+                codec=codec,
+            )
+            for slot_index in range(slot_count)
+        )
+    return slots
 
 
 def scheduling_workload(task: VideoTask, settings: EncodeSettings | None = None) -> float:
@@ -1774,6 +1938,27 @@ def write_compression_report(
     started_at: datetime,
     finished_at: datetime,
 ) -> Path:
+    text = build_compression_report(
+        tasks, results, settings, started_at, finished_at
+    )
+    if explicit_output_dir is not None:
+        report_dir = explicit_output_dir
+    else:
+        output_parents = {task.output.parent for task in tasks}
+        report_dir = next(iter(output_parents)) if len(output_parents) == 1 else Path.cwd()
+    report_path = report_dir / f"nvtranscode_report_{finished_at:%Y%m%d_%H%M%S}.txt"
+    write_text_atomically(report_path, text)
+    return report_path
+
+
+def build_compression_report(
+    tasks: Sequence[VideoTask],
+    results: Sequence[tuple[VideoTask, bool, str]],
+    settings: EncodeSettings | None,
+    started_at: datetime,
+    finished_at: datetime,
+) -> str:
+    """Build one self-contained report without touching the filesystem."""
     result_by_task = {task: (success, detail) for task, success, detail in results}
     successful_input = 0
     successful_output = 0
@@ -1851,15 +2036,99 @@ def write_compression_report(
         f"未执行：{unexecuted_count}",
     ]
 
-    if explicit_output_dir is not None:
-        report_dir = explicit_output_dir
-    else:
-        output_parents = {task.output.parent for task in tasks}
-        report_dir = next(iter(output_parents)) if len(output_parents) == 1 else Path.cwd()
-    report_dir.mkdir(parents=True, exist_ok=True)
-    report_path = report_dir / f"nvtranscode_report_{finished_at:%Y%m%d_%H%M%S}.txt"
-    report_path.write_text("\n".join(lines) + "\n", encoding="utf-8-sig")
-    return report_path
+    return "\n".join(lines) + "\n"
+
+
+def write_text_atomically(path: Path, text: str) -> None:
+    """Durably replace a text file without exposing a partially written report."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8-sig",
+            newline="",
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            dir=path.parent,
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            temporary.write(text)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_path, path)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def write_batch_compression_reports(
+    tasks: Sequence[VideoTask],
+    results: Sequence[tuple[VideoTask, bool, str]],
+    settings: EncodeSettings | None,
+    started_at: datetime,
+    finished_at: datetime,
+) -> tuple[list[Path], list[dict[str, str]]]:
+    """Write the complete APPDATA report plus one report per output folder.
+
+    Failures include the complete report text so the GUI can immediately offer
+    Save As without attempting to reconstruct state after the batch is cleared.
+    """
+    timestamp = f"{finished_at:%Y%m%d_%H%M%S}"
+    filename = f"nvtranscode_report_{timestamp}.txt"
+    complete_dir = APP_DATA_DIR / "reports"
+    sequence = 2
+    while (complete_dir / filename).exists():
+        filename = f"nvtranscode_report_{timestamp}_{sequence}.txt"
+        sequence += 1
+    destinations: list[tuple[str, Path, Sequence[VideoTask], Sequence[tuple[VideoTask, bool, str]]]] = [
+        ("完整报告", complete_dir / filename, tasks, results)
+    ]
+    result_by_task = {item[0]: item for item in results}
+    groups: dict[Path, list[VideoTask]] = {}
+    for task in tasks:
+        groups.setdefault(task.output.parent, []).append(task)
+    for folder, folder_tasks in groups.items():
+        folder_results = [
+            result_by_task[task] for task in folder_tasks if task in result_by_task
+        ]
+        destinations.append(
+            (f"文件夹报告（{folder}）", folder / filename, folder_tasks, folder_results)
+        )
+
+    saved: list[Path] = []
+    failures: list[dict[str, str]] = []
+    seen: set[Path] = set()
+    for label, path, report_tasks, report_results in destinations:
+        normalized = path.resolve(strict=False)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        text = build_compression_report(
+            report_tasks, report_results, settings, started_at, finished_at
+        )
+        try:
+            write_text_atomically(path, text)
+            saved.append(path)
+            say(f"压缩报告（{label}）：{path}")
+        except (OSError, TypeError) as exc:
+            warning = f"{label}无法写入 {path}：{exc}"
+            warn(warning)
+            failures.append(
+                {
+                    "label": label,
+                    "path": str(path),
+                    "error": str(exc),
+                    "content": text,
+                    "suggested_name": filename,
+                }
+            )
+    return saved, failures
 
 
 def remove_partial_output(task: VideoTask) -> None:
@@ -1931,60 +2200,213 @@ def apply_file_timestamps(path: Path, timestamps: FileTimestamps) -> None:
         _set_windows_creation_time(path, timestamps.created_ns)
 
 
+def _transient_file_access_error(exc: OSError) -> bool:
+    """Whether another process or a short-lived permission race may clear."""
+    return (
+        getattr(exc, "winerror", None) in {5, 32, 33}
+        or exc.errno in {errno.EACCES, errno.EBUSY, errno.EPERM}
+    )
+
+
+def _retry_delay(attempt: int) -> float:
+    return (0.25, 0.75, 2.0)[min(attempt, 2)]
+
+
 def preserve_source_when_output_is_larger(
     task: VideoTask,
     settings: EncodeSettings,
-) -> tuple[bool, str]:
+) -> tuple[str, str]:
     """Atomically replace a larger encode with the source when byte-copying is safe."""
     if task.is_clip:
-        return False, ""
+        return "unchanged", ""
     try:
         input_size = task.source.stat().st_size
         encoded_size = task.output.stat().st_size
     except OSError:
-        return False, ""
+        return "unchanged", ""
     if encoded_size <= input_size:
-        return False, ""
+        return "unchanged", ""
     if task.source.suffix.casefold() != task.output.suffix.casefold():
         warn(
             f"{task.source.name}：编码输出比源文件大，但容器不同，"
             "为避免扩展名与实际容器不符，保留编码输出"
         )
-        return False, ""
+        return "unchanged", ""
     if settings.resolution is not None or settings.fps_text is not None:
         warn(
             f"{task.source.name}：编码输出比源文件大，但任务要求转换"
             "分辨率或帧率，保留编码输出"
         )
-        return False, ""
+        return "unchanged", ""
 
     temporary_path: Path | None = None
+    copy_complete = False
     try:
-        with tempfile.NamedTemporaryFile(
-            prefix=f".{task.output.name}.",
-            suffix=".source-copy",
-            dir=task.output.parent,
-            delete=False,
-        ) as temporary:
-            temporary_path = Path(temporary.name)
-        shutil.copy2(task.source, temporary_path)
-        os.replace(temporary_path, task.output)
-        temporary_path = None
+        # Copy and replace are separate stages: a sharing violation during the
+        # final rename does not justify re-reading a multi-gigabyte source.
+        for attempt in range(4):
+            try:
+                if not copy_complete:
+                    if temporary_path is not None:
+                        temporary_path.unlink(missing_ok=True)
+                    with tempfile.NamedTemporaryFile(
+                        prefix=f".{task.output.name}.",
+                        suffix=".source-copy",
+                        dir=task.output.parent,
+                        delete=False,
+                    ) as temporary:
+                        temporary_path = Path(temporary.name)
+                    shutil.copy2(task.source, temporary_path)
+                    if temporary_path.stat().st_size != input_size:
+                        raise OSError(
+                            errno.EIO,
+                            f"源文件副本尺寸不一致（{temporary_path.stat().st_size} != {input_size}）",
+                        )
+                    copy_complete = True
+                os.replace(temporary_path, task.output)
+                temporary_path = None
+                break
+            except OSError as exc:
+                if not _transient_file_access_error(exc) or attempt >= 3:
+                    raise
+                delay = _retry_delay(attempt)
+                warn(
+                    f"{task.source.name}：原文件回退遇到暂时占用/权限冲突，"
+                    f"{delay:g} 秒后重试（{attempt + 1}/3）：{exc}"
+                )
+                time.sleep(delay)
     except OSError as exc:
-        warn(f"{task.source.name}：编码结果更大，但复制原文件失败：{exc}")
-        return False, ""
+        detail = (
+            f"编码结果更大，回退复制原文件失败：{exc}；"
+            "源文件未修改，现有编码输出已保留以避免数据丢失"
+        )
+        warn(f"{task.source.name}：{detail}")
+        return "failed", detail
     finally:
         if temporary_path is not None:
             try:
                 temporary_path.unlink(missing_ok=True)
-            except OSError:
-                pass
+            except OSError as cleanup_exc:
+                warn(f"无法清理原文件回退临时副本 {temporary_path}：{cleanup_exc}")
 
     detail = (
         "编码输出更大，已保留原文件（"
         f"{format_file_size(encoded_size)} -> {format_file_size(input_size)}）"
     )
-    return True, detail
+    return "kept", detail
+
+
+def mapped_cq(cq: float, source_codec: str, target_codec: str) -> float:
+    """Map an NVENC CQ value to a roughly equivalent quality in another codec."""
+    source = normalize_codec(source_codec)
+    target = normalize_codec(target_codec)
+    if source == target:
+        return max(0.0, min(51.0, float(cq)))
+    value = float(cq)
+    if source == "hevc" and target == "av1":
+        value *= HEVC_TO_AV1_CQ_RATIO
+    elif source == "av1" and target == "hevc":
+        value /= HEVC_TO_AV1_CQ_RATIO
+    return max(0.0, min(51.0, value))
+
+
+def _larger_output_can_try_alternative(task: VideoTask, settings: EncodeSettings) -> bool:
+    """Return whether the larger-output fallback is semantically safe for this task."""
+    if task.is_clip or settings.resolution is not None or settings.fps_text is not None:
+        return False
+    if task.source.suffix.casefold() != task.output.suffix.casefold():
+        return False
+    try:
+        return task.output.stat().st_size > task.source.stat().st_size
+    except OSError:
+        return False
+
+
+def try_alternative_codec_for_larger_output(
+    slot: EncoderSlot,
+    task: VideoTask,
+    settings: EncodeSettings,
+    ffmpeg: str,
+    hardware_decode: bool,
+    affinity_enabled: bool,
+    controller: ProcessController,
+    progress_handler: Callable[[dict[str, object]], None],
+    task_key: str,
+    label: str,
+) -> tuple[EncodeSettings, str]:
+    """Retry a bloated encode with the other codec, restoring the first on failure."""
+    if not settings.prefer_smaller_output or not _larger_output_can_try_alternative(task, settings):
+        return settings, ""
+    alternative_codec = "av1" if settings.codec == "hevc" else "hevc"
+    if not slot.gpu.can_encode(alternative_codec):
+        warn(f"{label}：择优需要 {alternative_codec.upper()}，但当前 GPU 不支持，改为保留源文件")
+        return settings, ""
+
+    alternative_settings = replace(
+        settings,
+        codec=alternative_codec,
+        cq=mapped_cq(settings.cq, settings.codec, alternative_codec),
+    )
+    saved_output: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            prefix=f".{task.output.name}.",
+            suffix=".first-encode",
+            dir=task.output.parent,
+            delete=False,
+        ) as temporary:
+            saved_output = Path(temporary.name)
+        os.replace(task.output, saved_output)
+        warn(
+            f"{label}：编码结果大于源文件，择优改用 {alternative_codec.upper()} "
+            f"CQ {alternative_settings.cq:g} 重试"
+        )
+        retry = build_ffmpeg_command(
+            task,
+            slot.gpu,
+            alternative_settings,
+            ffmpeg,
+            hardware_decode,
+            force_overwrite=True,
+        )
+        code, stderr_text = run_ffmpeg(
+            retry,
+            f"{label}/择优-{alternative_codec.upper()}",
+            slot.cpu_ids,
+            affinity_enabled,
+            controller,
+            progress_handler,
+            task_key,
+        )
+        if code == 0 and task.output.is_file():
+            saved_output.unlink(missing_ok=True)
+            saved_output = None
+            return alternative_settings, (
+                f"择优已改用 {alternative_codec.upper()}（CQ {alternative_settings.cq:g}）"
+            )
+        detail = error_tail(stderr_text) or f"FFmpeg 退出码 {code}"
+        warn(f"{label}：另一编码格式重试失败，恢复首次结果：{detail}")
+    except OSError as exc:
+        warn(f"{label}：无法执行另一编码格式择优，恢复首次结果：{exc}")
+    finally:
+        if saved_output is not None:
+            for attempt in range(4):
+                try:
+                    task.output.unlink(missing_ok=True)
+                    os.replace(saved_output, task.output)
+                    saved_output = None
+                    break
+                except OSError as exc:
+                    if not _transient_file_access_error(exc) or attempt >= 3:
+                        warn(
+                            f"{label}：恢复首次编码结果失败，安全副本保留在 "
+                            f"{saved_output}：{exc}"
+                        )
+                        break
+                    time.sleep(_retry_delay(attempt))
+        if saved_output is not None:
+            warn(f"{label}：未删除首次编码安全副本：{saved_output}")
+    return settings, ""
 
 
 @dataclass(frozen=True)
@@ -2165,9 +2587,42 @@ def encode_task(
         )
         return task, False, detail
     if code == 0:
-        kept_source, result_detail = preserve_source_when_output_is_larger(
+        settings, alternative_detail = try_alternative_codec_for_larger_output(
+            slot,
+            task,
+            settings,
+            ffmpeg,
+            hardware_decode,
+            affinity_enabled,
+            controller,
+            progress_handler,
+            task_key,
+            label,
+        )
+        preservation_status, result_detail = preserve_source_when_output_is_larger(
             task, settings
         )
+        if alternative_detail:
+            result_detail = (
+                f"{alternative_detail}；{result_detail}"
+                if result_detail else alternative_detail
+            )
+        if preservation_status == "failed":
+            say(f"[失败] {label}\n{result_detail}")
+            completed_now, queue_now = updated_totals("failed")
+            emit_event(
+                "task_done",
+                slot_id=slot.slot_id,
+                task_index=task_index,
+                status="failed",
+                source=str(task.source),
+                output=str(task.output),
+                error=result_detail,
+                completed_equivalent_frames=completed_now,
+                queue_equivalent_frames=queue_now,
+            )
+            return task, False, result_detail
+        kept_source = preservation_status == "kept"
         emit_event(
             "task_verification_start",
             slot_id=slot.slot_id,
@@ -2190,6 +2645,15 @@ def encode_task(
             validation_gpus or (slot.gpu,),
             task_key,
         )
+        retained_output = False
+        if (
+            not valid_output and settings.non_strict_validation
+            and task.output.is_file()
+            and not controller.cancelled and not controller.task_cancelled(task_key)
+        ):
+            retained_output = request_output_retention(
+                task, settings, ffprobe, validation_detail, controller
+            )
         if controller.cancelled or controller.task_cancelled(task_key):
             remove_partial_output(task)
             say(f"[取消] {label}：输出校验已取消")
@@ -2207,8 +2671,10 @@ def encode_task(
             )
             return task, False, detail
         if not valid_output:
-            remove_partial_output(task)
+            if not retained_output:
+                remove_partial_output(task)
             detail = f"编码完成，但最终输出未通过 GPU 校验：{validation_detail}"
+            detail += "；用户选择保留输出（校验未通过）" if retained_output else "；已删除未通过校验的输出"
             say(f"[失败] {label}\n{detail}")
             completed_now, queue_now = updated_totals("failed")
             emit_event(
@@ -2219,6 +2685,7 @@ def encode_task(
                 source=str(task.source),
                 output=str(task.output),
                 error=detail,
+                retained_output=retained_output,
                 completed_equivalent_frames=completed_now,
                 queue_equivalent_frames=queue_now,
             )
@@ -2434,7 +2901,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="NVENC 每帧分析：关闭、四分之一分辨率首遍、全分辨率双遍",
     )
     parser.add_argument(
-        "--gpu-config", type=Path, default=script_dir / "gpus.json",
+        "--gpu-config", type=Path, default=ensure_app_gpu_config(),
         help="GPU 编码/解码能力与编码核心数量 JSON",
     )
     parser.add_argument("--gpu", type=int, action="append", help="仅使用此 GPU index；可重复传入")
@@ -2453,6 +2920,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-software-fallback", action="store_true",
         help="声明支持的硬件解码实际失败时，不自动切换 CPU 解码重试",
+    )
+    parser.add_argument(
+        "--no-best-output", action="store_true",
+        help="编码结果大于源文件时关闭另一编码格式择优，直接复制源文件",
+    )
+    parser.add_argument(
+        "--non-strict-validation", action="store_true",
+        help="最终校验失败时由 GUI 弹窗选择是否保留输出；无 GUI 时仍按严格模式处理",
+    )
+    parser.add_argument(
+        "--encoder-hyperthread", action="store_true",
+        help="编码核心超线程：为每个实际 NVENC 编码引擎安排多个并发任务",
+    )
+    parser.add_argument(
+        "--hyperthread-mode", choices=("multiplier", "input"), default="multiplier",
+        help="超线程模式：multiplier 固定 x2；input 使用额外槽数量",
+    )
+    parser.add_argument(
+        "--hyperthread-extra", type=int, choices=range(1, 5), default=1,
+        help="输入数量模式下，每张显卡额外增加的并发槽数量（1-4）",
     )
     parser.add_argument("--dry-run", action="store_true", help="探测并显示调度/命令，但不执行编码")
     parser.add_argument(
@@ -2571,6 +3058,8 @@ def plan_cli_job(
         multipass=args.multipass,
         overwrite=args.overwrite,
         copy_subtitles=not args.no_subtitles,
+        prefer_smaller_output=not args.no_best_output,
+        non_strict_validation=args.non_strict_validation,
     )
     if hlm_document is not None:
         all_tasks = make_hlm_tasks(
@@ -2606,10 +3095,12 @@ def plan_cli_job(
     skipped_tasks = [task for task in all_tasks if task.skip_reason]
     tasks = [task for task in all_tasks if not task.skip_reason]
     for task in skipped_tasks:
-        say(
-            f"[跳过] {task.label}：{task.skip_reason}：{task.output}；"
-            "使用 --overwrite 可重新压制"
+        suffix = (
+            ""
+            if str(task.skip_reason).startswith("源视频无法读取")
+            else "；使用 --overwrite 可重新压制"
         )
+        say(f"[跳过] {task.label}：{task.skip_reason}：{task.output}{suffix}")
     for task in all_tasks:
         if task.overwrite_existing:
             warn(
@@ -2686,7 +3177,13 @@ def main(
         usable_gpus = plan.usable_gpus
         codec = plan.codec
         output_dir = plan.output_dir
-        slots = create_slots(usable_gpus, codec)
+        slots = create_slots(
+            usable_gpus,
+            codec,
+            args.encoder_hyperthread,
+            args.hyperthread_mode,
+            args.hyperthread_extra,
+        )
         active_slots = schedule_tasks(tasks, slots, settings)
 
         ordered_tasks: list[dict[str, object]] = []
@@ -2795,20 +3292,18 @@ def main(
             item for item in results
             if not item[1] and "取消" not in item[2] and not item[2].startswith("跳过：")
         ]
-        report_path: Path | None = None
-        try:
-            report_path = write_compression_report(
-                all_tasks,
-                results,
-                settings,
-                output_dir,
-                started_at,
-                datetime.now(),
-            )
-            say(f"压缩报告：{report_path}")
-            emit_event("report", path=str(report_path))
-        except OSError as exc:
-            warn(f"无法写入压缩报告：{exc}")
+        report_paths, report_errors = write_batch_compression_reports(
+            all_tasks,
+            results,
+            settings,
+            started_at,
+            datetime.now(),
+        )
+        report_path = report_paths[0] if report_paths else None
+        for failed_report in report_errors:
+            emit_event("report_save_failed", **failed_report)
+        if report_path:
+            emit_event("report", path=str(report_path), paths=[str(path) for path in report_paths])
         say(
             f"汇总：成功 {len(succeeded)}，失败 {len(failed)}，"
             f"取消 {len(cancelled)}，跳过 {len(skipped)}"
@@ -2820,6 +3315,9 @@ def main(
             cancelled=len(cancelled),
             skipped=len(skipped),
             report_path=str(report_path) if report_path else None,
+            report_paths=[str(path) for path in report_paths],
+            report_errors=report_errors,
+            failed_details=[f"{item[0].source.name}：{item[2]}" for item in failed],
         )
         if controller.cancelled:
             if report_path:
@@ -2914,6 +3412,66 @@ APP_DATA_DIR = (
 APP_LOG_DIR = APP_DATA_DIR / "logs"
 APP_LOG_PATH = APP_LOG_DIR / "CodecFoundry.log"
 APP_SETTINGS_PATH = APP_DATA_DIR / "settings.json"
+APP_GPU_CONFIG_PATH = APP_DATA_DIR / "gpus.json"
+APP_PAUSED_BATCH_PATH = APP_DATA_DIR / "paused_batch.json"
+PAUSED_BATCH_FORMAT_VERSION = 1
+INSTALL_GPU_CONFIG_PATH = Path(__file__).resolve().parent / "gpus.json"
+
+
+def write_paused_batch_state(document: dict[str, object]) -> None:
+    """Atomically replace the one permitted resumable-batch snapshot."""
+    payload = dict(document)
+    payload["format_version"] = PAUSED_BATCH_FORMAT_VERSION
+    payload["incomplete"] = True
+    write_text_atomically(
+        APP_PAUSED_BATCH_PATH,
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+    )
+
+
+def load_paused_batch_state() -> dict[str, object] | None:
+    """Return a validated incomplete snapshot, leaving corrupt files untouched."""
+    try:
+        document = json.loads(APP_PAUSED_BATCH_PATH.read_text(encoding="utf-8-sig"))
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        warn(f"暂停文件无法读取：{APP_PAUSED_BATCH_PATH}：{exc}")
+        return None
+    if not isinstance(document, dict) or document.get("incomplete") is not True:
+        return None
+    if document.get("format_version") != PAUSED_BATCH_FORMAT_VERSION:
+        warn(f"暂停文件版本不受支持：{document.get('format_version')}")
+        return None
+    resume_argv = document.get("resume_argv")
+    records = document.get("records")
+    if (
+        not isinstance(resume_argv, list)
+        or not resume_argv
+        or not all(isinstance(item, str) for item in resume_argv)
+        or not isinstance(records, list)
+        or not all(isinstance(item, dict) for item in records)
+    ):
+        warn("暂停文件缺少有效的恢复参数或任务列表")
+        return None
+    return document
+
+
+def remove_paused_batch_state() -> None:
+    APP_PAUSED_BATCH_PATH.unlink(missing_ok=True)
+
+
+def ensure_app_gpu_config() -> Path:
+    """Seed the writable per-user GPU database from the installed copy."""
+    if APP_GPU_CONFIG_PATH.is_file():
+        return APP_GPU_CONFIG_PATH
+    try:
+        APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(INSTALL_GPU_CONFIG_PATH, APP_GPU_CONFIG_PATH)
+        say(f"[GPU] 已将初始能力字典复制到：{APP_GPU_CONFIG_PATH}")
+    except OSError as exc:
+        raise TranscodeError(f"无法初始化 GPU 配置 {APP_GPU_CONFIG_PATH}：{exc}") from exc
+    return APP_GPU_CONFIG_PATH
 
 # ======================================================================
 # FFmpeg / ffprobe runtime provisioning
@@ -3736,6 +4294,7 @@ UPDATE_INFO_URLS = [
     "https://raw.githubusercontent.com/YCTS-otree/CodecFoundry/master/update.json",
     "https://gitee.com/otreee/CodecFoundry/raw/master/update.json",
 ]
+GPU_INFO_URLS = [url.rsplit("/", 1)[0] + "/gpus.json" for url in UPDATE_INFO_URLS]
 RELEASE_INFO_URLS = [
     "https://api.github.com/repos/YCTS-otree/CodecFoundry/releases/latest",
     "https://gitee.com/api/v5/repos/otreee/CodecFoundry/releases/latest",
@@ -3825,6 +4384,54 @@ def _is_newer_version(latest: object, current: object) -> bool:
     return str(latest).strip() != str(current).strip()
 
 
+def _gpu_database_version(data: dict) -> tuple[int, ...]:
+    return _version_key(
+        data.get("version") or data.get("data_version") or data.get("schema_version")
+    )
+
+
+def update_gpu_database() -> bool:
+    """Fetch the preferred GPU database and atomically install a newer revision."""
+    destination = ensure_app_gpu_config()
+    try:
+        current = json.loads(destination.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        current = {}
+    results = _fetch_urls_race(GPU_INFO_URLS, UPDATE_HTTP_TIMEOUT)
+    remote: dict | None = None
+    source = ""
+    for url in GPU_INFO_URLS:
+        candidate = results.get(url)
+        if isinstance(candidate, dict) and isinstance(candidate.get("gpus"), list):
+            remote, source = candidate, url
+            break
+    if remote is None:
+        return False
+    remote_version = _gpu_database_version(remote)
+    current_version = _gpu_database_version(current) if isinstance(current, dict) else tuple()
+    if remote_version and current_version and remote_version <= current_version:
+        return False
+    if not remote_version and current_version:
+        return False
+    temporary = destination.with_suffix(".json.tmp")
+    try:
+        APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
+        temporary.write_text(
+            json.dumps(remote, ensure_ascii=False, indent=4) + "\n", encoding="utf-8"
+        )
+        load_gpu_config(temporary)
+        temporary.replace(destination)
+    except (OSError, TranscodeError) as exc:
+        warn(f"GPU 能力字典更新失败：{exc}")
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+    say(f"[GPU] 能力字典已从 {source} 更新到版本 {'.'.join(map(str, remote_version)) or '未知'}")
+    return True
+
+
 def _get_update_json_info() -> dict | None:
     results = _fetch_urls_race(UPDATE_INFO_URLS, UPDATE_HTTP_TIMEOUT)
     for update_url in UPDATE_INFO_URLS:  # ordered: GitHub preferred
@@ -3883,9 +4490,16 @@ def check_for_updates(current_version: str | None = None) -> dict | None:
     global _update_sources_reachable
     _update_sources_reachable = False
     current_version = current_version or CODECFOUNDRY_VERSION
+    gpu_thread = threading.Thread(
+        target=update_gpu_database,
+        daemon=True,
+        name="CodecFoundryGpuDatabaseUpdater",
+    )
+    gpu_thread.start()
     info = _get_update_json_info()
     if info is None:
         info = _get_latest_release_info()
+    gpu_thread.join()
     if not info or not _is_newer_version(info["latest"], current_version):
         return None
     return info
@@ -3930,6 +4544,31 @@ class PendingTaskItem:
 class SchedulerRequest:
     argv: list[str]
     fresh: bool
+
+
+def wait_for_gui_unreadable_input_decision(
+    path: Path,
+    error: str,
+    controller: ProcessController | None,
+) -> str:
+    """Ask the Qt thread and keep the planning worker safely blocked meanwhile."""
+    response: queue.Queue[str] = queue.Queue(maxsize=1)
+    emit_event(
+        "unreadable_input",
+        path=str(path),
+        filename=path.name,
+        error=error,
+        response_queue=response,
+    )
+    while True:
+        if controller is not None and controller.cancelled:
+            return "pause"
+        if EVENT_CALLBACK is None:
+            return "pause"
+        try:
+            return response.get(timeout=0.25)
+        except queue.Empty:
+            continue
 
 
 def plan_task_assignment(
@@ -3990,9 +4629,11 @@ class LiveScheduler:
         self.completed_work = 0.0
         self.remaining_work = 0.0
         self.completed_count = 0
+        self.slot_completed: dict[int, tuple[int, float]] = {}
         self.debug_progress = False
         self._plan_emitted = False
         self.shutdown = False
+        self.pause_requested = False
         self.chunk_results: list[tuple[VideoTask, bool, str]] = []
         self.chunk_tasks: list[VideoTask] = []
         self.chunk_skipped: list[VideoTask] = []
@@ -4002,10 +4643,23 @@ class LiveScheduler:
 
     # -- scheduling core -------------------------------------------------
 
-    def _ensure_slots_locked(self, gpus: Sequence[GpuCapability], codec: str) -> bool:
+    def _ensure_slots_locked(
+        self,
+        gpus: Sequence[GpuCapability],
+        codec: str,
+        hyperthread_enabled: bool = False,
+        hyperthread_mode: str = "multiplier",
+        hyperthread_extra: int = 1,
+    ) -> bool:
         if codec in self.slots_by_codec:
             return False
-        new_slots = create_slots(gpus, codec)
+        new_slots = create_slots(
+            gpus,
+            codec,
+            hyperthread_enabled,
+            hyperthread_mode,
+            hyperthread_extra,
+        )
         for slot in new_slots:
             slot.slot_id = self._next_slot_id
             self._next_slot_id += 1
@@ -4046,7 +4700,20 @@ class LiveScheduler:
     def _append_request_locked(
         self, plan: JobPlan, args: argparse.Namespace, fresh: bool
     ) -> None:
-        created_slots = self._ensure_slots_locked(plan.usable_gpus, plan.codec)
+        # A fresh, idle batch gets a fresh slot topology. This makes settings
+        # saved during a previous encode take effect on the next compression.
+        if fresh and not self.waiting and not self.busy and self.chunk_started is None:
+            self.slots.clear()
+            self.slots_by_codec.clear()
+            self._next_slot_id = 0
+            self.slot_completed.clear()
+        created_slots = self._ensure_slots_locked(
+            plan.usable_gpus,
+            plan.codec,
+            bool(getattr(args, "encoder_hyperthread", False)),
+            str(getattr(args, "hyperthread_mode", "multiplier")),
+            int(getattr(args, "hyperthread_extra", 1)),
+        )
         codec_slots = self.slots_by_codec[plan.codec]
         loads: dict[int, float] = {slot.slot_id: 0.0 for slot in codec_slots}
         for item in self.waiting:
@@ -4113,6 +4780,27 @@ class LiveScheduler:
                 total_equivalent_frames=added_work,
             )
 
+        self._emit_slot_queues_locked()
+
+    def _emit_slot_queues_locked(self) -> None:
+        """Publish per-engine totals, including actual dispatch reassignment."""
+        summaries = []
+        for slot in self.slots:
+            count, work = self.slot_completed.get(slot.slot_id, (0, 0.0))
+            pending = [item for item in self.waiting if item.preferred_slot == slot.slot_id]
+            if slot.slot_id in self.busy:
+                pending.append(self.busy[slot.slot_id])
+            summaries.append({
+                "slot_id": slot.slot_id,
+                "completed_count": count,
+                "completed_equivalent": work,
+                "queue_total": count + len(pending),
+                "queue_equivalent": work + sum(
+                    task_equivalent_frames(item.task, item.settings) for item in pending
+                ),
+            })
+        emit_event("slot_queues", slots=summaries)
+
     def process_request(self, request: SchedulerRequest) -> None:
         parser = build_parser()
         argv = list(request.argv)
@@ -4144,13 +4832,16 @@ class LiveScheduler:
         with self.lock:
             if self.shutdown:
                 return
+            dispatched = False
             for slot in list(self.slots):
                 if slot.slot_id in self.busy:
                     continue
                 item = self._take_next_locked(slot)
                 if item is None:
                     continue
+                item.preferred_slot = slot.slot_id
                 self.busy[slot.slot_id] = item
+                dispatched = True
                 worker = threading.Thread(
                     target=self._worker_thread,
                     args=(slot, item),
@@ -4159,6 +4850,8 @@ class LiveScheduler:
                 )
                 self.busy_threads.add(worker)
                 worker.start()
+            if dispatched:
+                self._emit_slot_queues_locked()
 
     def _account_finished(
         self, item: PendingTaskItem, status: str | None
@@ -4200,8 +4893,14 @@ class LiveScheduler:
             self._account_finished(item, "failed")
         with self.lock:
             self.busy.pop(slot_id, None)
+            if result[1] or ("取消" not in result[2] and not result[2].startswith("跳过：")):
+                count, work = self.slot_completed.get(slot_id, (0, 0.0))
+                self.slot_completed[slot_id] = (
+                    count + 1, work + task_equivalent_frames(item.task, item.settings)
+                )
             self.chunk_results.append(result)
             self.busy_threads.discard(threading.current_thread())
+            self._emit_slot_queues_locked()
         self.wakeup.set()
 
     # -- user-visible queue order ----------------------------------------
@@ -4233,6 +4932,13 @@ class LiveScheduler:
 
     def request_shutdown(self) -> None:
         with self.lock:
+            self.shutdown = True
+        self.wakeup.set()
+
+    def request_pause(self) -> None:
+        """Stop dispatch and exit without finalizing the resumable batch."""
+        with self.lock:
+            self.pause_requested = True
             self.shutdown = True
         self.wakeup.set()
 
@@ -4273,20 +4979,19 @@ class LiveScheduler:
             if not item[1] and "取消" not in item[2] and not item[2].startswith("跳过：")
         ]
         settings = settings_list[0] if len(set(settings_list)) == 1 else None
-        report_path: Path | None = None
+        report_paths: list[Path] = []
+        report_errors: list[dict[str, str]] = []
         if tasks:
-            try:
-                report_path = write_compression_report(
-                    tasks,
-                    results,
-                    settings,
-                    None,
-                    started or datetime.now(),
-                    datetime.now(),
-                )
-                say(f"压缩报告：{report_path}")
-            except (OSError, TypeError) as exc:
-                warn(f"无法写入压缩报告：{exc}")
+            report_paths, report_errors = write_batch_compression_reports(
+                tasks,
+                results,
+                settings,
+                started or datetime.now(),
+                datetime.now(),
+            )
+            for failed_report in report_errors:
+                emit_event("report_save_failed", **failed_report)
+        report_path = report_paths[0] if report_paths else None
         say(
             f"汇总：成功 {len(succeeded)}，失败 {len(failed)}，"
             f"取消 {len(cancelled)}，跳过 {len(skipped_items)}"
@@ -4297,6 +5002,9 @@ class LiveScheduler:
             "cancelled": len(cancelled),
             "skipped": len(skipped_items),
             "report_path": str(report_path) if report_path else None,
+            "report_paths": [str(path) for path in report_paths],
+            "report_errors": report_errors,
+            "failed_details": [f"{item[0].source.name}：{item[2]}" for item in failed],
         }
 
     def scheduler_loop(self, intake: queue.Queue) -> int:
@@ -4318,6 +5026,10 @@ class LiveScheduler:
                     say(message)
                     emit_event("status", text=message)
                     self._emit_request_failed_if_idle(message)
+                except InputPlanningPaused as exc:
+                    message = str(exc)
+                    say(f"[暂停] {message}")
+                    emit_event("request_paused", text=message)
                 except TranscodeError as exc:
                     message = str(exc)
                     say(f"错误：{message}")
@@ -4325,6 +5037,14 @@ class LiveScheduler:
                     self._emit_request_failed_if_idle(message)
             self.dispatch()
             if stop_now:
+                if self.pause_requested:
+                    with self.lock:
+                        self.waiting.clear()
+                        self.waiting_keys.clear()
+                        self.remaining_work = 0.0
+                    emit_event("session_paused")
+                    exit_code = 131
+                    break
                 with self.lock:
                     for item in list(self.waiting):
                         emit_event(
@@ -4339,6 +5059,7 @@ class LiveScheduler:
                     self.waiting.clear()
                     self.waiting_keys.clear()
                     self.remaining_work = 0.0
+                    self._emit_slot_queues_locked()
                 summary = self._finalize_chunk()
                 emit_event("batch_done", **summary)
                 exit_code = 130 if self.controller.cancelled else 0
@@ -4346,15 +5067,21 @@ class LiveScheduler:
             if self._chunk_idle():
                 summary = self._finalize_chunk()
                 if summary.get("report_path"):
-                    emit_event("report", path=summary["report_path"])
+                    emit_event(
+                        "report",
+                        path=summary["report_path"],
+                        paths=summary.get("report_paths", []),
+                    )
                 emit_event("batch_done", **summary)
                 emit_event("session_idle", **summary)
         return exit_code
 
 
 DEFAULT_PREFERENCES: dict[str, object] = {
+    "config_version": PREFERENCES_FORMAT_VERSION,
     "codec": "HEVC（默认）",
-    "cq": "23",
+    "cq_hevc": "23",
+    "cq_av1": "28.405",
     "maxrate": "",
     "bufsize": "",
     "resolution": "",
@@ -4375,6 +5102,11 @@ DEFAULT_PREFERENCES: dict[str, object] = {
     "check_update_on_startup": True,
     "single_instance": True,
     "drag_animation": True,
+    "encoder_hyperthread": False,
+    "encoder_hyperthread_mode": "multiplier",
+    "encoder_hyperthread_extra": 1,
+    "prefer_smaller_output": True,
+    "non_strict_validation": True,
     "window_width": 1180,
     "window_height": 900,
     "window_maximized": False,
@@ -4481,6 +5213,16 @@ QPushButton#primaryButton, QPushButton#smallButton {{
     padding: 7px 14px;
 }}
 QPushButton#primaryButton:hover, QPushButton#smallButton:hover {{ background: {COLOR_BLUE_HOVER}; }}
+QPushButton#helpButton {{
+    background: {COLOR_BLUE};
+    color: white;
+    border: none;
+    border-radius: 14px;
+    padding: 0;
+    font-size: 11pt;
+    font-weight: 700;
+}}
+QPushButton#helpButton:hover {{ background: {COLOR_BLUE_HOVER}; }}
 QPushButton#dangerButton {{
     background: {COLOR_RED};
     color: white;
@@ -5059,7 +5801,61 @@ class SettingsDialog(QDialog):
         general_layout.addWidget(self.update_check)
         general_layout.addWidget(self.single_instance_check)
         general_layout.addWidget(self.drag_animation_check)
+        self.non_strict_check = QCheckBox("非严格模式：最终校验失败时询问是否保留输出")
+        self.non_strict_check.setChecked(host.non_strict_validation)
+        self.non_strict_check.setToolTip("显示期望值、实际值及校验失败原因；保留文件仍标记校验未通过。应用于之后启动的任务。")
+        general_layout.addWidget(self.non_strict_check)
         layout.addWidget(general_panel)
+
+        encoder_panel = QFrame()
+        encoder_panel.setObjectName("panel")
+        encoder_layout = QGridLayout(encoder_panel)
+        encoder_layout.setContentsMargins(14, 12, 14, 12)
+        encoder_layout.setHorizontalSpacing(10)
+        encoder_layout.setVerticalSpacing(8)
+        self.best_output_check = QCheckBox("择优机制")
+        self.best_output_check.setChecked(host.prefer_smaller_output)
+        best_help_button = QPushButton("?")
+        best_help_button.setObjectName("helpButton")
+        best_help_button.setFixedSize(28, 28)
+        best_help_button.setToolTip("查看择优机制说明")
+        best_help_button.clicked.connect(self._show_best_output_help)
+        encoder_layout.addWidget(self.best_output_check, 0, 0, 1, 3)
+        encoder_layout.addWidget(best_help_button, 0, 3, Qt.AlignmentFlag.AlignRight)
+
+        self.hyperthread_check = QCheckBox("编码核心超线程")
+        self.hyperthread_check.setChecked(host.encoder_hyperthread_enabled)
+        help_button = QPushButton("?")
+        help_button.setObjectName("helpButton")
+        help_button.setFixedSize(28, 28)
+        help_button.setToolTip("查看编码核心超线程使用建议")
+        help_button.clicked.connect(self._show_hyperthread_help)
+        self.hyperthread_mode_label = QLabel("超线程：")
+        self.hyperthread_mode_combo = QComboBox()
+        self.hyperthread_mode_combo.addItem("倍率模式", "multiplier")
+        self.hyperthread_mode_combo.addItem("输入数量", "input")
+        mode_index = self.hyperthread_mode_combo.findData(host.encoder_hyperthread_mode)
+        self.hyperthread_mode_combo.setCurrentIndex(max(0, mode_index))
+        self.hyperthread_multiplier_label = QLabel("x2")
+        self.hyperthread_multiplier_label.setObjectName("hint")
+        self.hyperthread_extra_spin = QSpinBox()
+        self.hyperthread_extra_spin.setRange(1, 4)
+        self.hyperthread_extra_spin.setPrefix("+")
+        self.hyperthread_extra_spin.setSuffix(" 个")
+        self.hyperthread_extra_spin.setValue(host.encoder_hyperthread_extra)
+        encoder_layout.addWidget(self.hyperthread_check, 1, 0, 1, 3)
+        encoder_layout.addWidget(help_button, 1, 3, Qt.AlignmentFlag.AlignRight)
+        encoder_layout.addWidget(self.hyperthread_mode_label, 2, 0)
+        encoder_layout.addWidget(self.hyperthread_mode_combo, 2, 1)
+        encoder_layout.addWidget(self.hyperthread_multiplier_label, 2, 2)
+        encoder_layout.addWidget(self.hyperthread_extra_spin, 2, 2)
+        encoder_layout.setColumnStretch(3, 1)
+        self.hyperthread_check.toggled.connect(self._sync_hyperthread_controls)
+        self.hyperthread_mode_combo.currentIndexChanged.connect(
+            self._sync_hyperthread_controls
+        )
+        self._sync_hyperthread_controls()
+        layout.addWidget(encoder_panel)
 
         log_panel = QFrame()
         log_panel.setObjectName("panel")
@@ -5119,11 +5915,51 @@ class SettingsDialog(QDialog):
         self.max_entries_spin.setEnabled(enabled)
         self.max_size_spin.setEnabled(enabled)
 
+    def _sync_hyperthread_controls(self, _value: object = None) -> None:
+        enabled = self.hyperthread_check.isChecked()
+        input_mode = self.hyperthread_mode_combo.currentData() == "input"
+        self.hyperthread_mode_label.setEnabled(enabled)
+        self.hyperthread_mode_combo.setEnabled(enabled)
+        self.hyperthread_multiplier_label.setVisible(not input_mode)
+        self.hyperthread_multiplier_label.setEnabled(enabled)
+        self.hyperthread_extra_spin.setVisible(input_mode)
+        self.hyperthread_extra_spin.setEnabled(enabled)
+
+    def _show_hyperthread_help(self) -> None:
+        QMessageBox.information(
+            self,
+            "编码核心超线程帮助",
+            "如果您的显卡的 Video Encode 稳定地低于 70%，可以试试超线程来吃满。\n\n"
+            "如果稳定低于 50%，可以试试“倍率模式 x2”。\n\n"
+            "如果在 70% 左右，可以试试“输入数量”，输入您的显卡编码引擎的数量的 1.5 倍。\n\n"
+            "不要在占用已经很高的情况下超线程或者过度超线程，那样不会更快，"
+            "只会因为反复切换数据导致更慢。",
+        )
+
+    def _show_best_output_help(self) -> None:
+        QMessageBox.information(
+            self,
+            "择优机制帮助",
+            "开启后，如果首次编码结果大于源文件，会用另一种编码格式和映射后的同质量 CQ "
+            "再编码一次；第二次仍不够小时才复制源文件。\n\n"
+            "关闭后保持原有行为：编码结果大于源文件时直接复制源文件。",
+        )
+
     def _restore_defaults(self) -> None:
+        self.non_strict_check.setChecked(bool(DEFAULT_PREFERENCES["non_strict_validation"]))
+        self.best_output_check.setChecked(bool(DEFAULT_PREFERENCES["prefer_smaller_output"]))
         self.debug_check.setChecked(bool(DEFAULT_PREFERENCES["debug_progress"]))
         self.update_check.setChecked(bool(DEFAULT_PREFERENCES["check_update_on_startup"]))
         self.single_instance_check.setChecked(bool(DEFAULT_PREFERENCES["single_instance"]))
         self.drag_animation_check.setChecked(bool(DEFAULT_PREFERENCES["drag_animation"]))
+        self.hyperthread_check.setChecked(bool(DEFAULT_PREFERENCES["encoder_hyperthread"]))
+        mode = str(DEFAULT_PREFERENCES["encoder_hyperthread_mode"])
+        self.hyperthread_mode_combo.setCurrentIndex(
+            max(0, self.hyperthread_mode_combo.findData(mode))
+        )
+        self.hyperthread_extra_spin.setValue(
+            int(DEFAULT_PREFERENCES["encoder_hyperthread_extra"])
+        )
         self.logging_check.setChecked(bool(DEFAULT_PREFERENCES["logging_enabled"]))
         self.max_entries_spin.setValue(int(DEFAULT_PREFERENCES["log_max_entries"]))
         self.max_size_spin.setValue(int(DEFAULT_PREFERENCES["log_max_size_mb"]))
@@ -5488,17 +6324,45 @@ class FfmpegSetupWindow(QDialog):
                 )
 
 
+def _write_preferences_document(preferences: dict[str, object]) -> None:
+    """Atomically write a complete preferences document."""
+    APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    document = dict(DEFAULT_PREFERENCES)
+    document.update(preferences)
+    document["config_version"] = PREFERENCES_FORMAT_VERSION
+    temporary_path = APP_SETTINGS_PATH.with_suffix(".json.tmp")
+    temporary_path.write_text(
+        json.dumps(document, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    temporary_path.replace(APP_SETTINGS_PATH)
+
+
 def load_app_preferences() -> dict[str, object]:
-    """Read and sanitize preferences; usable before any window exists."""
+    """Read preferences, replacing unreadable/pre-1.3.7 files with defaults."""
     preferences = dict(DEFAULT_PREFERENCES)
+    valid_document = False
     try:
         loaded = json.loads(APP_SETTINGS_PATH.read_text(encoding="utf-8"))
-        if isinstance(loaded, dict):
+        loaded_version = _version_tuple(
+            loaded.get("config_version") if isinstance(loaded, dict) else None
+        )
+        if (
+            isinstance(loaded, dict)
+            and loaded_version is not None
+            and loaded_version >= MIN_PREFERENCES_FORMAT_VERSION
+        ):
+            valid_document = True
             for key in preferences:
                 if key in loaded:
                     preferences[key] = loaded[key]
     except (OSError, json.JSONDecodeError, UnicodeError):
         pass
+    if not valid_document:
+        try:
+            _write_preferences_document(preferences)
+        except OSError:
+            pass
 
     def limited_int(key: str, default: int, minimum: int, maximum: int) -> int:
         try:
@@ -5513,6 +6377,11 @@ def load_app_preferences() -> dict[str, object]:
     preferences["log_max_size_mb"] = limited_int(
         "log_max_size_mb", 8, 1, 1024
     )
+    preferences["encoder_hyperthread_extra"] = limited_int(
+        "encoder_hyperthread_extra", 1, 1, 4
+    )
+    if preferences.get("encoder_hyperthread_mode") not in {"multiplier", "input"}:
+        preferences["encoder_hyperthread_mode"] = "multiplier"
     preferences["window_width"] = limited_int(
         "window_width", 1180, 900, 7680
     )
@@ -5541,6 +6410,26 @@ class CodecFoundryWindow(QMainWindow):
         self.check_update_on_startup = bool(self.preferences["check_update_on_startup"])
         self.single_instance_enabled = bool(self.preferences["single_instance"])
         self.drag_animation_enabled = bool(self.preferences["drag_animation"])
+        self.encoder_hyperthread_enabled = bool(
+            self.preferences["encoder_hyperthread"]
+        )
+        self.encoder_hyperthread_mode = str(
+            self.preferences["encoder_hyperthread_mode"]
+        )
+        self.encoder_hyperthread_extra = int(
+            self.preferences["encoder_hyperthread_extra"]
+        )
+        self.prefer_smaller_output = bool(self.preferences["prefer_smaller_output"])
+        self.non_strict_validation = bool(self.preferences["non_strict_validation"])
+        self._validation_reviews: deque = deque()
+        self._validation_review_active = False
+        self.cq_values = {
+            "hevc": str(self.preferences["cq_hevc"]),
+            "av1": str(self.preferences["cq_av1"]),
+        }
+        self._active_cq_codec = (
+            "av1" if self.preferences["codec"] == "AV1" else "hevc"
+        )
         try:
             APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
             APP_LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -5601,6 +6490,12 @@ class CodecFoundryWindow(QMainWindow):
         self.restart_batch_keys: set[str] = set()
         self.restart_keys: set[str] = set()
         self.batch_cancelled_count = 0
+        self.failure_alert_shown = False
+        self.pause_in_progress = False
+        self.paused_batch_active = False
+        self.restored_progress: dict[str, float | int] | None = None
+        self.resume_completed_offset = 0.0
+        self.restored_failed_details: list[str] = []
         self._update_check_running = False
         self._active_drag_key: str | None = None
         self._drag_index = 0
@@ -5720,8 +6615,11 @@ class CodecFoundryWindow(QMainWindow):
 
     def _apply_preferences(self) -> None:
         values = self.preferences
+        self.codec_combo.blockSignals(True)
         self.codec_combo.setCurrentText(str(values["codec"]))
-        self.cq_edit.setText(str(values["cq"]))
+        self.codec_combo.blockSignals(False)
+        self._active_cq_codec = "av1" if self.codec_combo.currentText() == "AV1" else "hevc"
+        self.cq_edit.setText(self.cq_values[self._active_cq_codec])
         self.maxrate_edit.setText(str(values["maxrate"]))
         self.bufsize_edit.setText(str(values["bufsize"]))
         self.resolution_edit.setText(str(values["resolution"]))
@@ -5741,9 +6639,12 @@ class CodecFoundryWindow(QMainWindow):
 
     def _collect_preferences(self) -> dict[str, object]:
         normal_size = self.normalGeometry().size() if self.isMaximized() else self.size()
+        self.cq_values[self._active_cq_codec] = self.cq_edit.text().strip()
         return {
+            "config_version": PREFERENCES_FORMAT_VERSION,
             "codec": self.codec_combo.currentText(),
-            "cq": self.cq_edit.text().strip(),
+            "cq_hevc": self.cq_values["hevc"],
+            "cq_av1": self.cq_values["av1"],
             "maxrate": self.maxrate_edit.text().strip(),
             "bufsize": self.bufsize_edit.text().strip(),
             "resolution": self.resolution_edit.text().strip(),
@@ -5764,6 +6665,11 @@ class CodecFoundryWindow(QMainWindow):
             "check_update_on_startup": self.check_update_on_startup,
             "single_instance": self.single_instance_enabled,
             "drag_animation": self.drag_animation_enabled,
+            "encoder_hyperthread": self.encoder_hyperthread_enabled,
+            "encoder_hyperthread_mode": self.encoder_hyperthread_mode,
+            "encoder_hyperthread_extra": self.encoder_hyperthread_extra,
+            "prefer_smaller_output": self.prefer_smaller_output,
+            "non_strict_validation": self.non_strict_validation,
             "window_width": max(900, normal_size.width()),
             "window_height": max(680, normal_size.height()),
             "window_maximized": self.isMaximized(),
@@ -5771,14 +6677,7 @@ class CodecFoundryWindow(QMainWindow):
 
     def _save_preferences(self) -> bool:
         try:
-            APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
-            temporary_path = APP_SETTINGS_PATH.with_suffix(".json.tmp")
-            temporary_path.write_text(
-                json.dumps(self._collect_preferences(), ensure_ascii=False, indent=2)
-                + "\n",
-                encoding="utf-8",
-            )
-            temporary_path.replace(APP_SETTINGS_PATH)
+            _write_preferences_document(self._collect_preferences())
             return True
         except OSError as exc:
             self._log(f"[警告] 无法保存个性化设置：{exc}")
@@ -5856,6 +6755,7 @@ class CodecFoundryWindow(QMainWindow):
         self.codec_combo = QComboBox()
         self.codec_combo.addItems(["HEVC（默认）", "AV1"])
         self.cq_edit = QLineEdit("23")
+        self.codec_combo.currentTextChanged.connect(self._on_codec_changed)
         self.maxrate_edit = QLineEdit()
         self.maxrate_edit.setPlaceholderText("如 20M")
         self.bufsize_edit = QLineEdit()
@@ -5929,6 +6829,30 @@ class CodecFoundryWindow(QMainWindow):
         grid.addWidget(checks, 5, 0, 1, 8)
         self.content_layout.addWidget(panel)
 
+    @staticmethod
+    def _codec_key(codec_text: str) -> str:
+        return "av1" if codec_text == "AV1" else "hevc"
+
+    @staticmethod
+    def _format_cq(value: float) -> str:
+        return f"{value:.3f}".rstrip("0").rstrip(".")
+
+    def _on_codec_changed(self, codec_text: str) -> None:
+        target_codec = self._codec_key(codec_text)
+        source_codec = self._active_cq_codec
+        if target_codec == source_codec:
+            return
+        current_text = self.cq_edit.text().strip()
+        self.cq_values[source_codec] = current_text
+        try:
+            mapped = mapped_cq(float(current_text), source_codec, target_codec)
+            target_text = self._format_cq(mapped)
+        except ValueError:
+            target_text = self.cq_values[target_codec]
+        self.cq_values[target_codec] = target_text
+        self._active_cq_codec = target_codec
+        self.cq_edit.setText(target_text)
+
     def _build_progress(self) -> None:
         self.overall_detail = QLabel("总进度 0.0% · 等待任务")
         self.overall_detail.setObjectName("hint")
@@ -5984,12 +6908,17 @@ class CodecFoundryWindow(QMainWindow):
         self.stop_button.setObjectName("dangerButton")
         self.stop_button.clicked.connect(self.stop_all)
         self.stop_button.setEnabled(False)
+        self.pause_button = QPushButton("暂停全部")
+        self.pause_button.setObjectName("primaryButton")
+        self.pause_button.clicked.connect(self.pause_all)
+        self.pause_button.setEnabled(False)
         self.start_button = QPushButton("开始压制")
         self.start_button.setObjectName("primaryButton")
         self.start_button.setMinimumWidth(180)
         self.start_button.clicked.connect(self.start)
         layout.addWidget(help_button)
         layout.addStretch(1)
+        layout.addWidget(self.pause_button)
         layout.addWidget(self.stop_button)
         layout.addWidget(self.start_button)
         self.bottom_layout.addWidget(row)
@@ -6377,10 +7306,22 @@ class CodecFoundryWindow(QMainWindow):
 
     def apply_settings_dialog(self, dialog: SettingsDialog) -> None:
         previous_debug = self.debug_progress_enabled
+        previous_hyperthread = (
+            self.encoder_hyperthread_enabled,
+            self.encoder_hyperthread_mode,
+            self.encoder_hyperthread_extra,
+        )
         self.debug_progress_enabled = dialog.debug_check.isChecked()
         self.check_update_on_startup = dialog.update_check.isChecked()
         self.single_instance_enabled = dialog.single_instance_check.isChecked()
         self.drag_animation_enabled = dialog.drag_animation_check.isChecked()
+        self.encoder_hyperthread_enabled = dialog.hyperthread_check.isChecked()
+        self.encoder_hyperthread_mode = str(
+            dialog.hyperthread_mode_combo.currentData()
+        )
+        self.encoder_hyperthread_extra = dialog.hyperthread_extra_spin.value()
+        self.prefer_smaller_output = dialog.best_output_check.isChecked()
+        self.non_strict_validation = dialog.non_strict_check.isChecked()
         self.logging_enabled = dialog.logging_check.isChecked()
         self.log_max_entries = dialog.max_entries_spin.value()
         self.log_max_size_mb = dialog.max_size_spin.value()
@@ -6402,6 +7343,20 @@ class CodecFoundryWindow(QMainWindow):
             f"[设置] 日志={'开启' if self.logging_enabled else '关闭'} · "
             f"最多 {self.log_max_entries} 个 · 单文件 {self.log_max_size_mb} MB"
         )
+        hyperthread_changed = previous_hyperthread != (
+            self.encoder_hyperthread_enabled,
+            self.encoder_hyperthread_mode,
+            self.encoder_hyperthread_extra,
+        )
+        running = bool(self.scheduler and self.scheduler.has_work()) or bool(
+            self.worker and self.worker.is_alive() and not self.start_button.isEnabled()
+        )
+        if hyperthread_changed and running:
+            QMessageBox.information(
+                self,
+                APP_TITLE,
+                "编码核心超线程设置已保存，将在下次压制时生效。",
+            )
         self._set_status("个性化设置已保存" if saved else "设置已应用，但配置文件保存失败")
 
     def open_log_folder(self) -> None:
@@ -6417,8 +7372,15 @@ class CodecFoundryWindow(QMainWindow):
         if self.worker and self.worker.is_alive():
             QMessageBox.information(self, APP_TITLE, "任务运行中，不能重置参数。")
             return
+        self.codec_combo.blockSignals(True)
         self.codec_combo.setCurrentIndex(0)
-        self.cq_edit.setText("23")
+        self.codec_combo.blockSignals(False)
+        self.cq_values = {
+            "hevc": str(DEFAULT_PREFERENCES["cq_hevc"]),
+            "av1": str(DEFAULT_PREFERENCES["cq_av1"]),
+        }
+        self._active_cq_codec = "hevc"
+        self.cq_edit.setText(self.cq_values["hevc"])
         self.maxrate_edit.clear()
         self.bufsize_edit.clear()
         self.resolution_edit.clear()
@@ -6494,11 +7456,31 @@ class CodecFoundryWindow(QMainWindow):
             args.append("--no-subtitles")
         if not self.affinity_check.isChecked():
             args.append("--no-cpu-affinity")
+        if not self.prefer_smaller_output:
+            args.append("--no-best-output")
+        if self.non_strict_validation:
+            args.append("--non-strict-validation")
+        if self.encoder_hyperthread_enabled:
+            args.extend([
+                "--encoder-hyperthread",
+                "--hyperthread-mode", self.encoder_hyperthread_mode,
+            ])
+            if self.encoder_hyperthread_mode == "input":
+                args.extend([
+                    "--hyperthread-extra", str(self.encoder_hyperthread_extra)
+                ])
         if self.debug_progress_enabled:
             args.append("--debug-progress")
         return args
 
     def start(self) -> None:
+        if self.paused_batch_active:
+            if self.resume_paused_batch_if_available():
+                return
+            self._set_status("暂停收尾尚未完成，请稍候再继续")
+            return
+        if APP_PAUSED_BATCH_PATH.is_file() and self.resume_paused_batch_if_available():
+            return
         if self.scheduler is not None and self.scheduler.has_work():
             QMessageBox.information(
                 self,
@@ -6528,10 +7510,12 @@ class CodecFoundryWindow(QMainWindow):
         self.intake_queue = intake_queue
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
+        self.pause_button.setEnabled(True)
 
         def run_scheduler() -> None:
             set_output_callback(self.bridge.log_message.emit)
             set_event_callback(self.bridge.backend_event.emit)
+            set_unreadable_input_callback(wait_for_gui_unreadable_input_decision)
             try:
                 code = scheduler.scheduler_loop(intake_queue)
             except SystemExit as exc:
@@ -6542,6 +7526,7 @@ class CodecFoundryWindow(QMainWindow):
                 )
                 code = 2
             finally:
+                set_unreadable_input_callback(None)
                 set_output_callback(None)
                 set_event_callback(None)
             self.bridge.finished.emit(code)
@@ -6631,9 +7616,161 @@ class CodecFoundryWindow(QMainWindow):
         self.pending_restarts.clear()
         self.restart_batch_keys.clear()
         self.stop_button.setEnabled(False)
+        self.pause_button.setEnabled(False)
+        self.paused_batch_active = False
+        self.pause_in_progress = False
+        try:
+            remove_paused_batch_state()
+        except OSError as exc:
+            self._log(f"[警告] 无法删除已放弃的暂停文件：{exc}")
         self._set_status("正在停止全部 FFmpeg 进程，请稍候……")
         self._log("[取消] 用户请求停止全部任务")
         threading.Thread(target=self._cancel_session, daemon=True).start()
+
+    def _build_pause_snapshot(self) -> dict[str, object]:
+        ordered_keys = list(self.waiting_order)
+        ordered_keys.extend(key for key in self.task_records if key not in ordered_keys)
+        records: list[dict[str, object]] = []
+        remaining: list[tuple[str, dict[str, object]]] = []
+        resumable_statuses = {"waiting", "running", "verifying", "stopping", "paused"}
+        for key in ordered_keys:
+            record = self.task_records.get(key)
+            if record is None:
+                continue
+            # Round-trip through JSON now so an unexpected Qt/Python object can
+            # never make the final atomic snapshot fail halfway through.
+            safe_record = json.loads(json.dumps(record, ensure_ascii=False, default=str))
+            status = str(safe_record.get("status") or "waiting")
+            if status in resumable_statuses or key in self.pending_restarts:
+                safe_record["status"] = "waiting"
+                safe_record["progress"] = 0.0
+                remaining.append((key, safe_record))
+            records.append(safe_record)
+        resume_args = self._build_restart_args(remaining) if remaining else None
+        if not resume_args:
+            resume_args = list(self.last_batch_args)
+        return {
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+            "original_argv": list(self.last_batch_args),
+            "resume_argv": list(resume_args),
+            "records": records,
+            "waiting_order": ordered_keys,
+            "input_items": [
+                self.input_list.item(index).text()
+                for index in range(self.input_list.count())
+            ],
+            "hlm_path": str(self.hlm_path) if self.hlm_path else None,
+            "progress": {
+                "total_equivalent_frames": self.total_equivalent_frames,
+                "completed_equivalent_frames": self.session_completed_equivalent,
+                "completed_count": self.session_completed_count,
+                "total_count": self.session_total_count,
+            },
+        }
+
+    def pause_all(self) -> None:
+        if self.pause_in_progress:
+            return
+        if not self.worker or not self.worker.is_alive() or not self.last_batch_args:
+            return
+        try:
+            snapshot = self._build_pause_snapshot()
+            write_paused_batch_state(snapshot)
+        except (OSError, TypeError, ValueError) as exc:
+            QMessageBox.critical(
+                self,
+                APP_TITLE,
+                f"无法保存暂停状态，因此没有停止任何任务：\n"
+                f"{APP_PAUSED_BATCH_PATH}\n\n{exc}",
+            )
+            return
+        self.pause_in_progress = True
+        self.paused_batch_active = True
+        self.pending_restarts.clear()
+        self.restart_keys.clear()
+        self.restart_batch_keys.clear()
+        self.pause_button.setEnabled(False)
+        self.stop_button.setEnabled(False)
+        self.start_button.setEnabled(False)
+        for key, record in list(self.task_records.items()):
+            if str(record.get("status") or "") in {
+                "waiting", "running", "verifying", "stopping"
+            }:
+                self._update_task_card(key, "paused", int(record.get("slot_id") or 0))
+        self._set_status("正在暂停全部任务并保存恢复状态……")
+        self._log(f"[暂停] 状态已原子保存：{APP_PAUSED_BATCH_PATH}")
+        threading.Thread(target=self._pause_session, daemon=True).start()
+
+    def _pause_session(self) -> None:
+        try:
+            if self.scheduler is not None:
+                self.scheduler.request_pause()
+            if self.controller is not None:
+                try:
+                    self.controller.cancel()
+                except Exception as exc:
+                    self._log(f"[暂停] 停止编码器异常（{type(exc).__name__}），已强制清扫")
+        finally:
+            if self.controller is not None:
+                self.controller.force_stop_all()
+            kill_all_app_processes()
+
+    def resume_paused_batch_if_available(self) -> bool:
+        if self.worker is not None and self.worker.is_alive():
+            return False
+        state = load_paused_batch_state()
+        if state is None:
+            self.paused_batch_active = False
+            return False
+        resume_args = [str(item) for item in state.get("resume_argv", [])]
+        records = [dict(item) for item in state.get("records", [])]
+        self.last_batch_args = [
+            str(item) for item in state.get("original_argv", resume_args)
+        ]
+        self.input_list.clear()
+        for item in state.get("input_items", []):
+            self.input_list.addItem(str(item))
+        raw_hlm = str(state.get("hlm_path") or "")
+        self.hlm_path = Path(raw_hlm) if raw_hlm else None
+        self._clear_task_cards()
+        saved_order = [str(item) for item in state.get("waiting_order", [])]
+        by_key = {
+            str(record.get("output") or record.get("source") or ""): record
+            for record in records
+        }
+        self.waiting_order = []
+        for key in [*saved_order, *(item for item in by_key if item not in saved_order)]:
+            record = by_key.get(key)
+            if not record:
+                continue
+            status = str(record.get("status") or "waiting")
+            self._create_task_card(int(record.get("slot_id") or 0), record, status)
+            self.waiting_order.append(key)
+        self._rebuild_task_sidebar(animate=False)
+        progress = state.get("progress")
+        self.restored_progress = dict(progress) if isinstance(progress, dict) else {}
+        self.resume_completed_offset = float(
+            self.restored_progress.get("completed_equivalent_frames", 0.0)
+        )
+        self.restored_failed_details = [
+            f"{record.get('filename') or record.get('source') or '未知文件'}："
+            f"{record.get('error') or record.get('detail') or '此前编码失败'}"
+            for record in records
+            if str(record.get("status") or "") == "failed"
+        ]
+        remaining_keys = {
+            key for key, record in by_key.items()
+            if str(record.get("status") or "") == "waiting"
+        }
+        self.restart_batch_active = bool(records)
+        self.restart_batch_keys = remaining_keys
+        self.paused_batch_active = True
+        self.pause_in_progress = False
+        self.start_button.setText("开始压制")
+        self._log(f"[恢复] 自动载入未完成暂停批次：{APP_PAUSED_BATCH_PATH}")
+        self._set_status("已载入暂停批次，正在继续未完成任务……")
+        self._launch_backend(resume_args, restart=bool(records))
+        return True
 
     def _cancel_session(self) -> None:
         # Stop dispatching new work first, then cancel every FFmpeg process,
@@ -6682,6 +7819,7 @@ class CodecFoundryWindow(QMainWindow):
             "queue_total": 0,
             "queue_equivalent": 0.0,
             "completed_equivalent": 0.0,
+            "completed_count": 0,
             "current_equivalent": 0.0,
             "progress": 0.0,
             "equivalent_fps": 0.0,
@@ -7151,6 +8289,12 @@ class CodecFoundryWindow(QMainWindow):
         if not widgets or record is None:
             return
         previous_status = str(record.get("status") or "")
+        if status == "waiting":
+            record["retained_output"] = False
+        if payload is not None and "retained_output" in payload:
+            record["retained_output"] = bool(payload["retained_output"])
+            record["validation_error"] = str(payload.get("error") or "")
+        retained = status == "failed" and bool(record.get("retained_output"))
         labels = {
             "waiting": ("等待中", COLOR_WAITING),
             "running": ("进行中", COLOR_RUNNING),
@@ -7159,9 +8303,12 @@ class CodecFoundryWindow(QMainWindow):
             "failed": ("失败", COLOR_FAILED),
             "cancelled": ("已停止", COLOR_FAILED),
             "stopping": ("停止中", COLOR_FAILED),
+            "paused": ("待继续", COLOR_WAITING),
             "skipped": ("已验证 / 跳过", COLOR_WAITING),
         }
         text, color = labels.get(status, (status, COLOR_MUTED))
+        if retained:
+            text, color = "已保留 · 校验未通过", COLOR_ORANGE
         widgets["status"].setText(text)
         widgets["status"].setStyleSheet(f"color: {color}; font-weight: 600;")
         widgets["engine"].setText(f"E{slot_id}" if slot_id >= 0 else "—")
@@ -7173,6 +8320,7 @@ class CodecFoundryWindow(QMainWindow):
             "running": ("停止", "taskStopButton", True),
             "verifying": ("停止", "taskStopButton", True),
             "stopping": ("停止中", "taskStopButton", False),
+            "paused": ("待继续", "taskRestartButton", False),
             "cancelled": ("重新开始", "taskRestartButton", True),
             "failed": ("重新开始", "taskRestartButton", True),
             "success": ("打开", "taskOpenButton", True),
@@ -7181,6 +8329,8 @@ class CodecFoundryWindow(QMainWindow):
         action_text, object_name, enabled = action_states.get(
             status, ("重新开始", "taskRestartButton", True)
         )
+        if retained:
+            action_text, object_name, enabled = "打开", "taskOpenButton", True
         action.setText(action_text)
         action.setObjectName(object_name)
         action.setEnabled(enabled)
@@ -7188,6 +8338,10 @@ class CodecFoundryWindow(QMainWindow):
         action.style().polish(action)
         if status != "success":
             widgets["after"].hide()
+        if retained:
+            widgets["after"].setText(str(record.get("validation_error") or "校验未通过，用户选择保留输出"))
+            widgets["after"].setStyleSheet(f"color: {COLOR_ORANGE};")
+            widgets["after"].show()
         if status == "success" and payload:
             input_size = int(payload.get("input_size") or record.get("input_size") or 0)
             output_size = int(payload.get("output_size") or 0)
@@ -7221,6 +8375,9 @@ class CodecFoundryWindow(QMainWindow):
             return
         status = str(record.get("status") or "")
         slot_id = int(record.get("slot_id") or 0)
+        if status == "failed" and record.get("retained_output"):
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(record.get("output") or task_key)))
+            return
         if status == "waiting":
             if task_key in self.pending_restarts:
                 self.pending_restarts.pop(task_key, None)
@@ -7285,6 +8442,9 @@ class CodecFoundryWindow(QMainWindow):
 
     def _handle_backend_event(self, event_type: str, raw_payload: object) -> None:
         payload = dict(raw_payload) if isinstance(raw_payload, dict) else {}
+        if event_type == "validation_review":
+            self._handle_validation_review(payload)
+            return
         if event_type == "probe_progress":
             progress = max(0.0, min(1.0, float(payload.get("progress") or 0)))
             current = int(payload.get("current") or 0)
@@ -7304,13 +8464,42 @@ class CodecFoundryWindow(QMainWindow):
             self.report_path = str(payload.get("path") or "")
             self._set_status(f"压缩报告已保存：{self.report_path}")
             return
+        if event_type == "report_save_failed":
+            self._save_failed_report_as(payload)
+            return
+        if event_type == "unreadable_input":
+            self._handle_unreadable_input(payload)
+            return
         if event_type == "batch_done":
             self.batch_cancelled_count = int(payload.get("cancelled") or 0)
+            restored_failed = len(self.restored_failed_details)
+            total_failed = int(payload.get("failed") or 0) + restored_failed
+            if total_failed > 0 and not self.failure_alert_shown:
+                self.failure_alert_shown = True
+                combined = dict(payload)
+                combined["failed"] = total_failed
+                combined["failed_details"] = [
+                    *self.restored_failed_details,
+                    *list(payload.get("failed_details") or []),
+                ]
+                self._show_batch_failure_alert(combined)
             return
         if event_type == "request_failed":
             self.stop_button.setEnabled(False)
+            self.pause_button.setEnabled(False)
             self.start_button.setEnabled(not self.closing)
             self._set_status(f"启动失败：{payload.get('text', '')}")
+            return
+        if event_type == "request_paused":
+            self._set_status(str(payload.get("text") or "已暂停任务规划"))
+            QTimer.singleShot(0, self.pause_all)
+            return
+        if event_type == "session_paused":
+            self.pause_button.setEnabled(False)
+            self.stop_button.setEnabled(False)
+            self.start_button.setText("继续任务")
+            self.start_button.setEnabled(not self.closing)
+            self._set_status("全部任务已暂停；当前编码任务已归回待完成")
             return
         if event_type == "session_idle":
             self._handle_session_idle(payload)
@@ -7348,6 +8537,14 @@ class CodecFoundryWindow(QMainWindow):
             elif box.clickedButton() is gitee_button:
                 QDesktopServices.openUrl(QUrl(gitee_page))
             return
+        if event_type == "slot_queues":
+            for summary in payload.get("slots", []):
+                slot_id = int(summary["slot_id"])
+                state = self.slot_states.setdefault(slot_id, self._new_slot_state())
+                state.update(summary)
+                if slot_id in self.slot_widgets:
+                    self._update_slot_queue(slot_id)
+            return
         if event_type == "slots_changed":
             slots = list(payload.get("slots", []))
             for slot_plan in slots:
@@ -7361,11 +8558,31 @@ class CodecFoundryWindow(QMainWindow):
                     )
             return
         if event_type == "plan":
+            self.failure_alert_shown = False
             slots = list(payload.get("slots", []))
             self._reset_session_counters()
             self.batch_skipped_count = int(payload.get("skipped_count") or 0)
-            self.total_equivalent_frames = float(payload.get("total_equivalent_frames") or 0)
-            self.session_total_count = int(payload.get("task_count") or 0)
+            remaining_work = float(payload.get("total_equivalent_frames") or 0)
+            remaining_count = int(payload.get("task_count") or 0)
+            if self.restored_progress is not None:
+                saved = self.restored_progress
+                self.session_completed_equivalent = float(
+                    saved.get("completed_equivalent_frames", 0.0)
+                )
+                self.session_completed_count = int(saved.get("completed_count", 0))
+                self.total_equivalent_frames = max(
+                    float(saved.get("total_equivalent_frames", 0.0)),
+                    self.session_completed_equivalent + remaining_work,
+                )
+                self.session_total_count = max(
+                    int(saved.get("total_count", 0)),
+                    self.session_completed_count + remaining_count,
+                )
+                self.restored_progress = None
+            else:
+                self.resume_completed_offset = 0.0
+                self.total_equivalent_frames = remaining_work
+                self.session_total_count = remaining_count
             display_slots = int(payload.get("display_slots") or 0)
             self.slot_states.clear()
             self._ensure_slot_cards(display_slots)
@@ -7422,8 +8639,18 @@ class CodecFoundryWindow(QMainWindow):
                 f"已安排 {int(payload.get('task_count') or 0)} 个视频 · "
                 f"跳过 {self.batch_skipped_count} 个"
             )
+            if self.total_equivalent_frames and self.session_completed_equivalent:
+                restored_ratio = min(
+                    1.0,
+                    self.session_completed_equivalent / self.total_equivalent_frames,
+                )
+                self.overall_progress.setValue(round(restored_ratio * 1000))
+                self.overall_detail.setText(
+                    f"总进度 {restored_ratio * 100:.1f}% · 已恢复暂停批次"
+                )
             return
         if event_type == "tasks_added":
+            self.failure_alert_shown = False
             added_keys: set[str] = set()
             for raw_task in list(payload.get("ordered_tasks", [])):
                 task = dict(raw_task)
@@ -7468,10 +8695,6 @@ class CodecFoundryWindow(QMainWindow):
         if event_type == "task_start":
             state.update(
                 {
-                    "task_index": int(payload.get("task_index") or 0),
-                    "queue_total": int(payload.get("queue_total") or 0),
-                    "queue_equivalent": float(payload.get("queue_equivalent_frames") or 0),
-                    "completed_equivalent": float(payload.get("completed_equivalent_frames") or 0),
                     "current_equivalent": float(payload.get("equivalent_frames") or 0),
                     "progress": 0.0,
                     "active": True,
@@ -7480,7 +8703,10 @@ class CodecFoundryWindow(QMainWindow):
                 }
             )
             self.session_completed_equivalent = float(
-                payload.get("completed_equivalent_frames")
+                (
+                    float(payload.get("completed_equivalent_frames") or 0.0)
+                    + self.resume_completed_offset
+                )
                 or self.session_completed_equivalent
             )
             self._record_queue_sample(state)
@@ -7516,6 +8742,8 @@ class CodecFoundryWindow(QMainWindow):
             return
         if event_type == "task_done":
             status = str(payload.get("status") or "failed")
+            if self.pause_in_progress and status == "cancelled":
+                status = "paused"
             task_key = str(payload.get("output") or payload.get("source") or "")
             self._update_task_card(task_key, status, slot_id, payload)
             state["active"] = False
@@ -7523,13 +8751,28 @@ class CodecFoundryWindow(QMainWindow):
             self.active_slot_files.pop(slot_id, None)
             if status in {"success", "failed"}:
                 state["progress"] = 1.0
+                state["completed_count"] = int(state.get("completed_count") or 0) + 1
+                state["completed_equivalent"] = (
+                    float(state.get("completed_equivalent") or 0)
+                    + float(state.get("current_equivalent") or 0)
+                )
                 self.session_completed_equivalent = float(
-                    payload.get("completed_equivalent_frames")
+                    (
+                        float(payload.get("completed_equivalent_frames") or 0.0)
+                        + self.resume_completed_offset
+                    )
                     or self.session_completed_equivalent
                 )
                 self.session_completed_count += 1
                 widgets["current"].setValue(1000)
-            label = {"success": "已完成并通过校验", "failed": "失败", "cancelled": "已停止"}.get(status, status)
+            label = {
+                "success": "已完成并通过校验",
+                "failed": "失败",
+                "cancelled": "已停止",
+                "paused": "待继续",
+            }.get(status, status)
+            if payload.get("retained_output"):
+                label = "已保留输出 · 校验未通过"
             widgets["current_text"].setText(f"当前任务：{label}")
             widgets["filename"].setText(f"{state['filename']} · {label}")
             state["current_equivalent"] = 0.0
@@ -7538,13 +8781,186 @@ class CodecFoundryWindow(QMainWindow):
             self._update_active_status()
             self._update_overall_progress()
 
+    def _handle_validation_review(self, payload: dict[str, object]) -> None:
+        """Serialize decisions from concurrent engines on the Qt thread."""
+        self._validation_reviews.append(payload)
+        if self._validation_review_active:
+            return
+        self._validation_review_active = True
+        try:
+            while self._validation_reviews:
+                review = self._validation_reviews.popleft()
+                response = review.get("response_queue")
+                controller = review.get("controller")
+                output = str(review.get("output") or "")
+
+                def cancelled():
+                    return self.closing or (
+                        controller is not None
+                        and (controller.cancelled or controller.task_cancelled(output))
+                    )
+
+                decision = "keep"
+                try:
+                    if cancelled():
+                        decision = "delete"
+                        continue
+                    box = QMessageBox(self)
+                    box.setIcon(QMessageBox.Icon.Warning)
+                    box.setWindowTitle("非严格模式 · 输出校验未通过")
+                    box.setTextFormat(Qt.TextFormat.PlainText)
+                    box.setText(f"是否保留本次输出文件？\n{output}")
+                    box.setInformativeText(
+                        str(review.get("difference") or "校验未通过")
+                        + "\n\n保留后仍标记校验未通过，并在报告中记录；源文件不受影响。"
+                        + "\n关闭此提示默认保留输出。"
+                    )
+                    box.setDetailedText(f"源文件：{review.get('source', '')}\n输出文件：{output}")
+                    keep = box.addButton("保留输出文件", QMessageBox.ButtonRole.AcceptRole)
+                    delete = box.addButton("删除输出文件", QMessageBox.ButtonRole.DestructiveRole)
+                    box.setDefaultButton(keep)
+                    box.setEscapeButton(keep)
+                    box.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+                    # Stop/pause/exit must release both the modal dialog and worker.
+                    timer = QTimer(box)
+                    timer.setInterval(100)
+                    timer.timeout.connect(lambda: box.reject() if cancelled() else None)
+                    timer.start()
+                    try:
+                        box.exec()
+                    finally:
+                        timer.stop()
+                    if cancelled() or box.clickedButton() is delete:
+                        decision = "delete"
+                finally:
+                    try:
+                        response.put_nowait(decision)
+                    except (AttributeError, queue.Full):
+                        pass
+        finally:
+            self._validation_review_active = False
+
+    def _handle_unreadable_input(self, payload: dict[str, object]) -> None:
+        """Resolve an unreadable source without letting planning continue unseen."""
+        path = Path(str(payload.get("path") or ""))
+        error = str(payload.get("error") or "ffprobe 无法读取该视频")
+        response = payload.get("response_queue")
+        decision = "pause"
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        while not self.closing:
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Critical)
+            box.setWindowTitle(f"{APP_TITLE} · 视频无法读取")
+            box.setText(f"无法读取视频：\n{path}")
+            box.setInformativeText(
+                "文件可能尚未写完、已损坏，或缺少 MP4 的 moov 信息。\n"
+                "请选择暂停本次任务、跳过此文件继续，或打开视频所在位置。"
+            )
+            box.setDetailedText(error)
+            pause_button = box.addButton("暂停", QMessageBox.ButtonRole.RejectRole)
+            skip_button = box.addButton("跳过", QMessageBox.ButtonRole.AcceptRole)
+            open_button = box.addButton(
+                "打开视频所在位置", QMessageBox.ButtonRole.ActionRole
+            )
+            box.setDefaultButton(pause_button)
+            box.setEscapeButton(pause_button)
+            box.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked is open_button:
+                opened = QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.parent)))
+                if not opened:
+                    QMessageBox.warning(
+                        self, APP_TITLE, f"无法打开视频所在位置：\n{path.parent}"
+                    )
+                continue
+            decision = "skip" if clicked is skip_button else "pause"
+            break
+        try:
+            response.put_nowait(decision)
+        except (AttributeError, queue.Full):
+            pass
+
+    def _save_failed_report_as(self, payload: dict[str, object]) -> None:
+        """Immediately offer a user-selected destination for an unsaved report."""
+        label = str(payload.get("label") or "压缩报告")
+        original_path = str(payload.get("path") or "")
+        error = str(payload.get("error") or "未知错误")
+        content = str(payload.get("content") or "")
+        suggested_name = str(payload.get("suggested_name") or "nvtranscode_report.txt")
+        QMessageBox.warning(
+            self,
+            APP_TITLE,
+            f"{label}保存失败：\n{original_path}\n\n{error}\n\n请选择其他保存位置。",
+        )
+        initial = str(Path.home() / "Documents" / suggested_name)
+        while True:
+            chosen, _ = QFileDialog.getSaveFileName(
+                self,
+                f"另存{label}",
+                initial,
+                "文本报告 (*.txt);;所有文件 (*)",
+            )
+            if not chosen:
+                return
+            destination = Path(chosen)
+            try:
+                write_text_atomically(destination, content)
+            except (OSError, TypeError) as exc:
+                QMessageBox.critical(
+                    self,
+                    APP_TITLE,
+                    f"仍无法保存报告：\n{destination}\n\n{exc}\n\n请重新选择位置。",
+                )
+                initial = str(destination)
+                continue
+            self.report_path = str(destination)
+            self._log(f"压缩报告已另存：{destination}")
+            self._set_status(f"压缩报告已另存：{destination}")
+            return
+
+    def _show_batch_failure_alert(self, payload: dict[str, object]) -> None:
+        failed = int(payload.get("failed") or 0)
+        details = [str(item) for item in list(payload.get("failed_details") or [])]
+        detail_text = "\n\n".join(details[:5])
+        if len(details) > 5:
+            detail_text += f"\n\n……另有 {len(details) - 5} 项，请查看压缩报告。"
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Critical)
+        box.setWindowTitle(f"{APP_TITLE} · 编码失败")
+        box.setText(f"批处理已完成，但有 {failed} 个文件失败。")
+        box.setInformativeText(
+            (detail_text + "\n\n" if detail_text else "")
+            + "源文件不会被删除或覆盖。请查看任务列表和压缩报告后重试。"
+        )
+        box.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        box.exec()
+
     def _handle_session_idle(self, payload: dict[str, object]) -> None:
         if self.scheduler is not None and self.scheduler.has_work():
             return
         self.batch_cancelled_count = int(payload.get("cancelled") or 0)
+        failed_count = int(payload.get("failed") or 0) + len(self.restored_failed_details)
         self.stop_button.setEnabled(False)
+        self.pause_button.setEnabled(False)
         self.start_button.setEnabled(not self.closing)
-        if self.batch_cancelled_count:
+        self.start_button.setText("开始压制")
+        self.pause_in_progress = False
+        self.paused_batch_active = False
+        self.resume_completed_offset = 0.0
+        self.restored_failed_details = []
+        try:
+            remove_paused_batch_state()
+        except OSError as exc:
+            self._log(f"[警告] 批次完成，但无法删除暂停文件：{exc}")
+        if failed_count:
+            self._set_status(f"批处理结束 · 失败 {failed_count} 个任务，请查看报告")
+        elif self.batch_cancelled_count:
             self._set_status(f"批处理结束 · 已停止 {self.batch_cancelled_count} 个任务")
         else:
             if self.total_equivalent_frames > 0:
@@ -7556,10 +8972,10 @@ class CodecFoundryWindow(QMainWindow):
             self._set_status(f"全部任务已完成并验证{suffix}")
 
     def _queue_processed(self, state: dict[str, object]) -> float:
-        """Session-wide processed equivalent frames including this slot's current file."""
+        """Processed equivalent frames belonging to this engine only."""
         current = float(state.get("current_equivalent") or 0)
         progress = float(state.get("progress") or 0)
-        return self.session_completed_equivalent + current * progress
+        return float(state.get("completed_equivalent") or 0) + current * progress
 
     def _combined_rate(self) -> float:
         rate = 0.0
@@ -7584,10 +9000,10 @@ class CodecFoundryWindow(QMainWindow):
     def _update_slot_queue(self, slot_id: int) -> None:
         state = self.slot_states[slot_id]
         widgets = self.slot_widgets[slot_id]
-        total = self.total_equivalent_frames
+        total = float(state.get("queue_equivalent") or 0)
         processed = self._queue_processed(state)
         percentage = min(1.0, processed / total) if total else 0.0
-        rate = self._combined_rate()
+        rate = float(state.get("equivalent_fps") or 0)
         remaining = max(0.0, total - processed)
         eta = (
             self._format_duration(remaining / rate)
@@ -7596,7 +9012,7 @@ class CodecFoundryWindow(QMainWindow):
         )
         widgets["queue"].setValue(round(percentage * 1000))
         widgets["queue_text"].setText(
-            f"队列 {self.session_completed_count}/{self.session_total_count} · "
+            f"队列 {int(state.get('completed_count') or 0)}/{int(state.get('queue_total') or 0)} · "
             f"{percentage * 100:.1f}% · ETA {eta}"
         )
 
@@ -7643,6 +9059,7 @@ class CodecFoundryWindow(QMainWindow):
         has_pending_restarts = bool(self.pending_restarts) and not self.closing
         self.start_button.setEnabled(not self.closing and not has_pending_restarts)
         self.stop_button.setEnabled(False)
+        self.pause_button.setEnabled(False)
         if code == 0 and self.batch_cancelled_count:
             self._set_status(f"批处理结束 · 已停止 {self.batch_cancelled_count} 个任务")
         elif code == 0:
@@ -7655,6 +9072,12 @@ class CodecFoundryWindow(QMainWindow):
             self._set_status(f"全部任务已完成并验证{suffix}")
         elif code == 130:
             self._set_status("全部任务已取消")
+        elif code == 131:
+            self.pause_in_progress = False
+            self.paused_batch_active = True
+            self.start_button.setText("继续任务")
+            self.start_button.setEnabled(not self.closing)
+            self._set_status("全部任务已暂停，恢复状态已保存")
         else:
             self._set_status(f"批处理结束，退出码 {code}；请查看运行信息")
         if self.closing:
@@ -7730,19 +9153,17 @@ class CodecFoundryWindow(QMainWindow):
         changes_title.setObjectName("sectionTitle")
         changes = QLabel(
             f"v{APP_VERSION}（当前版本）\n"
-            "  1. 使用 PySide6 重构为前后端单文件应用\n"
-            "  2. 支持 NVIDIA HEVC / AV1 与多编码核心调度\n"
-            "  3. 已有输出和新编码输出均执行 GPU / NVDEC 全量校验\n"
-            "  4. 提供 CQ-VBR、实时进度、任务队列和安全退出保护\n"
-            "  5. 支持直接拖入视频文件或文件夹\n"
-            "  6. 单实例运行（可在设置关闭）：FlashCut 重复联动合并进现有编码队列\n"
-            "  7. 等待任务长按缩小 85% + 边框高亮 + 抓取光标拖拽排序，插入位置\n"
-            "     高亮线提示、其他卡片平滑避让（动效可在设置关闭），自上而下执行\n"
-            "  8. 启动期 FFmpeg 专用窗口：双进度条 / 速度 / 剩余时间，支持托盘\n"
-            "     “后台加载”，关闭窗口取消安装不留后台进程，可一键全局安装（UAC）\n"
-            "  9. FFmpeg 自动检测与安装：复用 FlashCut / DJI DPVC，先测速选最快\n"
-            "     源（GitHub / Gitee），断点续传解压，原生多线程解压，gyan.dev 兜底\n"
-            " 10. 主窗口支持拖动边框原生缩放；启动自动检查更新（并发竞速、GitHub 优先）"
+            "  1. HEVC / AV1 切换自动映射并分别保存 CQ\n"
+            "  2. 新增输出膨胀时换编码格式重试的择优机制\n"
+            "  3. 配置格式最低版本提升到 1.3.7\n\n"
+            "v1.3.6\n"
+            "  1. GPU 能力字典迁移到 APPDATA，并支持在线原子更新\n"
+            "  2. 新增 GPU 型号近似匹配、未知型号试运行与 CPU 解码降级\n\n"
+            "v1.3.5\n"
+            "  1. 队列严格按任务卡从上到下执行，任务状态原位更新\n"
+            "  2. 修复停止残留进程、卡片拖拽嵌入和宽度自适应问题\n\n"
+            "v1.3.2-beta 及更早\n"
+            "  单实例 IPC、任务拖拽排序、FFmpeg 自动配置与更新检查"
         )
         changes.setWordWrap(True)
         changes.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
@@ -7970,7 +9391,7 @@ class CodecFoundryWindow(QMainWindow):
         if self.closing:
             event.ignore()
             return
-        running = bool(self.worker and self.worker.is_alive())
+        running = self._has_active_tasks()
         was_topmost = bool(
             self.windowFlags() & Qt.WindowType.WindowStaysOnTopHint
         )
@@ -8003,6 +9424,17 @@ class CodecFoundryWindow(QMainWindow):
         event.ignore()
         self._begin_safe_exit(running)
 
+    def _has_active_tasks(self) -> bool:
+        """An idle persistent scheduler is not an encoding/verification task."""
+        if not (self.worker and self.worker.is_alive()):
+            return False
+        return bool(
+            self.active_slot_files
+            or (self.scheduler is not None and self.scheduler.has_work())
+            or (self.intake_queue is not None and not self.intake_queue.empty())
+            or not self.start_button.isEnabled()
+        )
+
     def _begin_safe_exit(self, running: bool) -> None:
         """Hide first, then perform process cleanup and log persistence."""
         self.closing = True
@@ -8032,6 +9464,10 @@ class CodecFoundryWindow(QMainWindow):
             self.stop_all()
             self.close_timer.start()
         else:
+            if self.scheduler is not None:
+                self.scheduler.request_shutdown()
+            if self.worker and self.worker.is_alive():
+                self.close_timer.start()
             self._finish_close_when_ready()
 
     def _finish_close_when_ready(self) -> None:
@@ -8229,6 +9665,7 @@ def gui_main(argv: Sequence[str] | None = None) -> int:
             window.import_hlm(gui_options.hlm)
         except TranscodeError as exc:
             QMessageBox.critical(window, APP_TITLE, f"无法载入 FlashCut HLM：\n{exc}")
+    QTimer.singleShot(0, window.resume_paused_batch_if_available)
     window.start_auto_update_check()
     return app.exec()
 
