@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CodecFoundry v1.4.1-Beta: single-file PySide6 NVENC transcoder.
+"""CodecFoundry v1.4.1: single-file PySide6 NVENC transcoder.
 
 The backend and desktop UI intentionally live in this one source file.  The GPU
 capability database remains external data: driver/runtime discovery tells us which
@@ -121,7 +121,7 @@ VIDEO_EXTENSIONS = {
     ".3gp", ".avi", ".flv", ".m2ts", ".m4v", ".mkv", ".mov", ".mp4",
     ".mpeg", ".mpg", ".mts", ".ts", ".webm", ".wmv",
 }
-CODECFOUNDRY_VERSION = "1.4.1-Beta"
+CODECFOUNDRY_VERSION = "1.4.1"
 PREFERENCES_FORMAT_VERSION = "1.3.7"
 MIN_PREFERENCES_FORMAT_VERSION = (1, 3, 7, 0)
 HEVC_TO_AV1_CQ_RATIO = 1.235
