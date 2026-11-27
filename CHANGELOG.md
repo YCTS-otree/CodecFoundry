@@ -26,3 +26,6 @@
 
 ### Changed
 - 将 1.4.1 标记为正式版，并统一应用与 Windows 可执行文件的版本信息。
+
+### Notes
+- 使用 Advanced Installer 命令行构建并验证 Windows 安装包，构建步骤见 AIP_BUILD.md。
